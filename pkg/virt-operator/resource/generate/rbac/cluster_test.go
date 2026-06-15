@@ -82,7 +82,7 @@ var _ = Describe("Cluster role and cluster role bindings", func() {
 		Context("admin cluster role", func() {
 
 			DescribeTable("should contain rule to", func(apiGroup, resource string, verbs ...string) {
-				clusterRole := getObject(clusterObjects, reflect.TypeOf(&rbacv1.ClusterRole{}), "kubevirt.io:admin").(*rbacv1.ClusterRole)
+				clusterRole := getObject(clusterObjects, reflect.TypeOf(&rbacv1.ClusterRole{}), ClusterRoleAdmin).(*rbacv1.ClusterRole)
 				Expect(clusterRole).ToNot(BeNil())
 				expectExactRuleExists(clusterRole.Rules, apiGroup, resource, verbs...)
 			},
@@ -151,13 +151,12 @@ var _ = Describe("Cluster role and cluster role bindings", func() {
 		Context("edit cluster role", func() {
 
 			DescribeTable("should contain rule to", func(apiGroup, resource string, verbs ...string) {
-				clusterRole := getObject(clusterObjects, reflect.TypeOf(&rbacv1.ClusterRole{}), "kubevirt.io:edit").(*rbacv1.ClusterRole)
+				clusterRole := getObject(clusterObjects, reflect.TypeOf(&rbacv1.ClusterRole{}), ClusterRoleEdit).(*rbacv1.ClusterRole)
 				Expect(clusterRole).ToNot(BeNil())
 				expectExactRuleExists(clusterRole.Rules, apiGroup, resource, verbs...)
 			},
 				Entry(fmt.Sprintf("get %s/%s", virtv1.SubresourceGroupName, apiVMInstancesConsole), virtv1.SubresourceGroupName, apiVMInstancesConsole, "get"),
 				Entry(fmt.Sprintf("get %s/%s", virtv1.SubresourceGroupName, apiVMInstancesVNC), virtv1.SubresourceGroupName, apiVMInstancesVNC, "get"),
-				Entry(fmt.Sprintf("get %s/%s", virtv1.SubresourceGroupName, apiVMInstancesVNCScreenshot), virtv1.SubresourceGroupName, apiVMInstancesVNCScreenshot, "get"),
 				Entry(fmt.Sprintf("get %s/%s", virtv1.SubresourceGroupName, apiVMInstancesPortForward), virtv1.SubresourceGroupName, apiVMInstancesPortForward, "get"),
 				Entry(fmt.Sprintf("get %s/%s", virtv1.SubresourceGroupName, apiVMInstancesGuestOSInfo), virtv1.SubresourceGroupName, apiVMInstancesGuestOSInfo, "get"),
 				Entry(fmt.Sprintf("get %s/%s", virtv1.SubresourceGroupName, apiVMInstancesFileSysList), virtv1.SubresourceGroupName, apiVMInstancesFileSysList, "get"),
@@ -234,7 +233,7 @@ var _ = Describe("Cluster role and cluster role bindings", func() {
 		Context("view cluster role", func() {
 
 			DescribeTable("should contain rule to", func(apiGroup, resource string, verbs ...string) {
-				clusterRole := getObject(clusterObjects, reflect.TypeOf(&rbacv1.ClusterRole{}), "kubevirt.io:view").(*rbacv1.ClusterRole)
+				clusterRole := getObject(clusterObjects, reflect.TypeOf(&rbacv1.ClusterRole{}), ClusterRoleView).(*rbacv1.ClusterRole)
 				Expect(clusterRole).ToNot(BeNil())
 				expectExactRuleExists(clusterRole.Rules, apiGroup, resource, verbs...)
 			},

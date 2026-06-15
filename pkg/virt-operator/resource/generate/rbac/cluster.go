@@ -37,6 +37,13 @@ import (
 )
 
 const (
+	// ClusterRoleAdmin is the name of the ClusterRole that aggregates to the default admin role
+	ClusterRoleAdmin = "kubevirt.io:admin"
+	// ClusterRoleEdit is the name of the ClusterRole that aggregates to the default edit role
+	ClusterRoleEdit = "kubevirt.io:edit"
+	// ClusterRoleView is the name of the ClusterRole that aggregates to the default view role
+	ClusterRoleView = "kubevirt.io:view"
+
 	defaultClusterRoleName          = "kubevirt.io:default"
 	instancetypeViewClusterRoleName = "instancetype.kubevirt.io:view"
 
@@ -188,7 +195,7 @@ func newAdminClusterRole() *rbacv1.ClusterRole {
 			Kind:       "ClusterRole",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "kubevirt.io:admin",
+			Name: ClusterRoleAdmin,
 			Labels: map[string]string{
 				virtv1.AppLabel: "",
 				"rbac.authorization.k8s.io/aggregate-to-admin": "true",
@@ -322,21 +329,10 @@ func newAdminClusterRole() *rbacv1.ClusterRole {
 				},
 				Resources: []string{
 					apiVMBackups,
+					apiVMBackupTrackers,
 				},
 				Verbs: []string{
 					"get", "delete", "create", "update", "patch", "list", "watch", "deletecollection",
-				},
-			},
-			{
-				APIGroups: []string{
-					backup.GroupName,
-				},
-				Resources: []string{
-					apiVMBackupTrackers,
-					apiVMBackupTrackers + "/status",
-				},
-				Verbs: []string{
-					"get", "list", "watch", "create", "update", "patch",
 				},
 			},
 			{
@@ -408,7 +404,7 @@ func newEditClusterRole() *rbacv1.ClusterRole {
 			Kind:       "ClusterRole",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "kubevirt.io:edit",
+			Name: ClusterRoleEdit,
 			Labels: map[string]string{
 				virtv1.AppLabel: "",
 				"rbac.authorization.k8s.io/aggregate-to-edit": "true",
@@ -422,7 +418,6 @@ func newEditClusterRole() *rbacv1.ClusterRole {
 				Resources: []string{
 					apiVMInstancesConsole,
 					apiVMInstancesVNC,
-					apiVMInstancesVNCScreenshot,
 					apiVMInstancesPortForward,
 					apiVMInstancesGuestOSInfo,
 					apiVMInstancesFileSysList,
@@ -542,6 +537,7 @@ func newEditClusterRole() *rbacv1.ClusterRole {
 				},
 				Resources: []string{
 					apiVMBackups,
+					apiVMBackupTrackers,
 				},
 				Verbs: []string{
 					"get", "delete", "create", "update", "patch", "list", "watch",
@@ -666,7 +662,7 @@ func newViewClusterRole() *rbacv1.ClusterRole {
 			Kind:       "ClusterRole",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "kubevirt.io:view",
+			Name: ClusterRoleView,
 			Labels: map[string]string{
 				virtv1.AppLabel: "",
 				"rbac.authorization.k8s.io/aggregate-to-view": "true",
@@ -747,6 +743,7 @@ func newViewClusterRole() *rbacv1.ClusterRole {
 				},
 				Resources: []string{
 					apiVMBackups,
+					apiVMBackupTrackers,
 				},
 				Verbs: []string{
 					"get", "list", "watch",

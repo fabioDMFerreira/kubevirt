@@ -18,6 +18,7 @@ import (
 	"kubevirt.io/kubevirt/pkg/defaults"
 	"kubevirt.io/kubevirt/pkg/libdv"
 	"kubevirt.io/kubevirt/pkg/libvmi"
+	"kubevirt.io/kubevirt/pkg/pointer"
 	"kubevirt.io/kubevirt/pkg/testutils"
 	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
 )
@@ -191,5 +192,72 @@ var _ = Describe("Defaults", func() {
 				}, runtime.GOARCH),
 			)
 		})
+	})
+
+	Context("Arm64 bootloader", func() {
+		DescribeTable("should correctly default SecureBoot", func(vmi *v1.VirtualMachineInstance, expectedEFI *v1.EFI) {
+			defaults.SetArm64Defaults(&vmi.Spec)
+			Expect(vmi.Spec.Domain.Firmware).ToNot(BeNil())
+			Expect(vmi.Spec.Domain.Firmware.Bootloader).ToNot(BeNil())
+			if expectedEFI == nil {
+				Expect(vmi.Spec.Domain.Firmware.Bootloader.EFI).To(BeNil())
+			} else {
+				Expect(vmi.Spec.Domain.Firmware.Bootloader.EFI).ToNot(BeNil())
+				Expect(vmi.Spec.Domain.Firmware.Bootloader.EFI.SecureBoot).To(Equal(expectedEFI.SecureBoot))
+			}
+		},
+			Entry("to false when no bootloader is specified",
+				libvmi.New(libvmi.WithArchitecture("arm64")),
+				&v1.EFI{SecureBoot: pointer.P(false)},
+			),
+			Entry("preserving SecureBoot when explicitly enabled",
+				libvmi.New(libvmi.WithArchitecture("arm64"), libvmi.WithUefi(true)),
+				&v1.EFI{SecureBoot: pointer.P(true)},
+			),
+			Entry("preserving SecureBoot when explicitly disabled",
+				libvmi.New(libvmi.WithArchitecture("arm64"), libvmi.WithUefi(false)),
+				&v1.EFI{SecureBoot: pointer.P(false)},
+			),
+			Entry("not setting SecureBoot when bootloader is not EFI",
+				func() *v1.VirtualMachineInstance {
+					vmi := libvmi.New(libvmi.WithArchitecture("arm64"))
+					vmi.Spec.Domain.Firmware = &v1.Firmware{Bootloader: &v1.Bootloader{}}
+					return vmi
+				}(),
+				nil,
+			),
+			Entry("to false when EFI is set without SecureBoot",
+				func() *v1.VirtualMachineInstance {
+					vmi := libvmi.New(libvmi.WithArchitecture("arm64"))
+					vmi.Spec.Domain.Firmware = &v1.Firmware{Bootloader: &v1.Bootloader{EFI: &v1.EFI{}}}
+					return vmi
+				}(),
+				&v1.EFI{SecureBoot: pointer.P(false)},
+			),
+		)
+	})
+
+	Context("SupportsPCIeHotplug", func() {
+		DescribeTable("should report PCIe hotplug support based on architecture and machine type",
+			func(arch string, machineType *string, expected bool) {
+				spec := &v1.VirtualMachineInstanceSpec{
+					Architecture: arch,
+				}
+				if machineType != nil {
+					spec.Domain.Machine = &v1.Machine{Type: *machineType}
+				}
+				Expect(defaults.SupportsPCIeHotplug(spec)).To(Equal(expected))
+			},
+			Entry("amd64 with q35", "amd64", pointer.P("pc-q35-3.0"), true),
+			Entry("amd64 with no machine type", "amd64", nil, true),
+			Entry("amd64 with i440fx", "amd64", pointer.P("pc-i440fx-2.12"), false),
+			Entry("arm64 with virt", "arm64", pointer.P("virt"), true),
+			Entry("arm64 with versioned virt", "arm64", pointer.P("virt-6.2"), true),
+			Entry("arm64 with no machine type", "arm64", nil, true),
+			Entry("empty arch with q35", "", pointer.P("pc-q35-3.0"), true),
+			Entry("empty arch with no machine type", "", nil, true),
+			Entry("s390x", "s390x", nil, false),
+			Entry("ppc64le", "ppc64le", nil, false),
+		)
 	})
 })

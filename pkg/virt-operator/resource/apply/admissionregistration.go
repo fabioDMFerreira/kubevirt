@@ -16,6 +16,9 @@ import (
 	"kubevirt.io/client-go/log"
 
 	"kubevirt.io/kubevirt/pkg/apimachinery/patch"
+	"kubevirt.io/kubevirt/pkg/controller"
+	"kubevirt.io/kubevirt/pkg/virt-config/featuregate"
+	"kubevirt.io/kubevirt/pkg/virt-operator/resource/generate/components"
 )
 
 func (r *Reconciler) createOrUpdateValidatingWebhookConfigurations(caBundle []byte) error {
@@ -198,10 +201,12 @@ func (r *Reconciler) createOrUpdateValidatingWebhookConfiguration(webhook *admis
 
 	if !exists {
 		r.expectations.ValidationWebhook.RaiseExpectations(r.kvKey, 1, 0)
+		origWebhook := webhook
 		webhook, err := r.createValidatingWebhookConfiguration(webhook)
 		if err != nil {
 			r.expectations.ValidationWebhook.LowerExpectations(r.kvKey, 1, 0)
-			return fmt.Errorf("unable to create validatingwebhook %+v: %v", webhook, err)
+			log.Log.V(2).Infof("failed to create validatingwebhook %s: %+v", origWebhook.Name, origWebhook)
+			return fmt.Errorf("unable to create validatingwebhook %s: %v", origWebhook.Name, err)
 		}
 
 		SetGeneration(&r.kv.Status.Generations, webhook)
@@ -225,9 +230,11 @@ func (r *Reconciler) createOrUpdateValidatingWebhookConfiguration(webhook *admis
 	if err != nil {
 		return err
 	}
+	origWebhook := webhook
 	webhook, err = r.patchValidatingWebhookConfiguration(webhook, patchBytes)
 	if err != nil {
-		return fmt.Errorf("unable to update validatingwebhookconfiguration %+v: %v", webhook, err)
+		log.Log.V(2).Infof("failed to update validatingwebhookconfiguration %s: %+v", origWebhook.Name, origWebhook)
+		return fmt.Errorf("unable to update validatingwebhookconfiguration %s: %v", origWebhook.Name, err)
 	}
 
 	SetGeneration(&r.kv.Status.Generations, webhook)
@@ -238,9 +245,55 @@ func (r *Reconciler) createOrUpdateValidatingWebhookConfiguration(webhook *admis
 
 func (r *Reconciler) createOrUpdateMutatingWebhookConfigurations(caBundle []byte) error {
 	for _, webhook := range r.targetStrategy.MutatingWebhookConfigurations() {
+		// The virt-launcher pod mutator webhook is feature-gated behind ContainerPathVolumes.
+		// It's included in MutatingWebhookConfigurations() so the cleanup loop doesn't delete it,
+		// but sync is handled separately by createOrDeleteContainerPathVolumesWebhook which
+		// checks the feature gate and creates or deletes accordingly.
+		// This mirrors how ExportProxyDeployments are handled: included in Deployments() for
+		// cleanup purposes, but synced via a separate feature-gated loop.
+		if webhook.Name == components.VirtLauncherPodMutatingWebhookName {
+			continue
+		}
 		err := r.createOrUpdateMutatingWebhookConfiguration(webhook, caBundle)
 		if err != nil {
 			return err
+		}
+	}
+
+	return nil
+}
+
+func (r *Reconciler) createOrDeleteContainerPathVolumesWebhook(caBundle []byte) error {
+	webhook := components.NewVirtLauncherPodMutatingWebhookConfiguration(r.kv.Namespace)
+
+	if r.isFeatureGateEnabled(featuregate.ContainerPathVolumesGate) {
+		return r.createOrUpdateMutatingWebhookConfiguration(webhook, caBundle)
+	}
+
+	// Feature gate is disabled, delete the webhook if it exists
+	_, exists, _ := r.stores.MutatingWebhookCache.Get(webhook)
+	if !exists {
+		// Also check directly in case cache is not populated
+		_, err := r.clientset.AdmissionregistrationV1().MutatingWebhookConfigurations().Get(
+			context.Background(), webhook.Name, metav1.GetOptions{})
+		if errors.IsNotFound(err) {
+			return nil
+		} else if err != nil {
+			return err
+		}
+		exists = true
+	}
+
+	if exists {
+		if key, err := controller.KeyFunc(webhook); err == nil {
+			r.expectations.MutatingWebhook.AddExpectedDeletion(r.kvKey, key)
+			err := r.clientset.AdmissionregistrationV1().MutatingWebhookConfigurations().Delete(
+				context.Background(), webhook.Name, metav1.DeleteOptions{})
+			if err != nil {
+				r.expectations.MutatingWebhook.DeletionObserved(r.kvKey, key)
+				return fmt.Errorf("unable to delete mutatingwebhook %s: %v", webhook.Name, err)
+			}
+			log.Log.V(2).Infof("mutatingwebhookconfiguration %v deleted (feature gate disabled)", webhook.Name)
 		}
 	}
 
@@ -294,10 +347,12 @@ func (r *Reconciler) createOrUpdateMutatingWebhookConfiguration(webhook *admissi
 
 	if !exists {
 		r.expectations.MutatingWebhook.RaiseExpectations(r.kvKey, 1, 0)
+		origWebhook := webhook
 		webhook, err := r.createMutatingWebhookConfiguration(webhook)
 		if err != nil {
 			r.expectations.MutatingWebhook.LowerExpectations(r.kvKey, 1, 0)
-			return fmt.Errorf("unable to create mutatingwebhook %+v: %v", webhook, err)
+			log.Log.V(2).Infof("failed to create mutatingwebhook %s: %+v", origWebhook.Name, origWebhook)
+			return fmt.Errorf("unable to create mutatingwebhook %s: %v", origWebhook.Name, err)
 		}
 
 		SetGeneration(&r.kv.Status.Generations, webhook)
@@ -320,9 +375,11 @@ func (r *Reconciler) createOrUpdateMutatingWebhookConfiguration(webhook *admissi
 	if err != nil {
 		return err
 	}
+	origWebhook := webhook
 	webhook, err = r.patchMutatingWebhookConfiguration(webhook, patchBytes)
 	if err != nil {
-		return fmt.Errorf("unable to update mutatingwebhookconfiguration %+v: %v", webhook, err)
+		log.Log.V(2).Infof("failed to update mutatingwebhookconfiguration %s: %+v", origWebhook.Name, origWebhook)
+		return fmt.Errorf("unable to update mutatingwebhookconfiguration %s: %v", origWebhook.Name, err)
 	}
 
 	SetGeneration(&r.kv.Status.Generations, webhook)
@@ -358,7 +415,8 @@ func (r *Reconciler) createOrUpdateValidatingAdmissionPolicyBinding(validatingAd
 		_, err := admissionRegistrationV1.ValidatingAdmissionPolicyBindings().Create(context.Background(), validatingAdmissionPolicyBinding, metav1.CreateOptions{})
 		if err != nil {
 			r.expectations.ValidatingAdmissionPolicyBinding.LowerExpectations(r.kvKey, 1, 0)
-			return fmt.Errorf("unable to create validatingAdmissionPolicyBinding %+v: %v", validatingAdmissionPolicyBinding, err)
+			log.Log.V(2).Infof("failed to create validatingAdmissionPolicyBinding %s: %+v", validatingAdmissionPolicyBinding.Name, validatingAdmissionPolicyBinding)
+			return fmt.Errorf("unable to create validatingAdmissionPolicyBinding %s: %v", validatingAdmissionPolicyBinding.Name, err)
 		}
 
 		return nil
@@ -379,7 +437,8 @@ func (r *Reconciler) createOrUpdateValidatingAdmissionPolicyBinding(validatingAd
 	}
 	p, err := patchSet.GeneratePayload()
 	if err != nil {
-		return fmt.Errorf("unable to generate validatingAdmissionPolicyBinding patch operations for %+v: %v", validatingAdmissionPolicyBinding, err)
+		log.Log.V(2).Infof("failed to generate validatingAdmissionPolicyBinding patch for %s: %+v", validatingAdmissionPolicyBinding.Name, validatingAdmissionPolicyBinding)
+		return fmt.Errorf("unable to generate validatingAdmissionPolicyBinding patch operations for %s: %v", validatingAdmissionPolicyBinding.Name, err)
 	}
 
 	_, err = admissionRegistrationV1.ValidatingAdmissionPolicyBindings().Patch(context.Background(),
@@ -388,7 +447,8 @@ func (r *Reconciler) createOrUpdateValidatingAdmissionPolicyBinding(validatingAd
 		p,
 		metav1.PatchOptions{})
 	if err != nil {
-		return fmt.Errorf("unable to patch validatingAdmissionPolicyBinding %+v: %v", validatingAdmissionPolicyBinding, err)
+		log.Log.V(2).Infof("failed to patch validatingAdmissionPolicyBinding %s: %+v", validatingAdmissionPolicyBinding.Name, validatingAdmissionPolicyBinding)
+		return fmt.Errorf("unable to patch validatingAdmissionPolicyBinding %s: %v", validatingAdmissionPolicyBinding.Name, err)
 	}
 
 	log.Log.V(2).Infof("validatingAdmissionPolicyBinding %v patched", validatingAdmissionPolicyBinding.GetName())
@@ -423,7 +483,8 @@ func (r *Reconciler) createOrUpdateValidatingAdmissionPolicy(validatingAdmission
 		_, err := admissionRegistrationV1.ValidatingAdmissionPolicies().Create(context.Background(), validatingAdmissionPolicy, metav1.CreateOptions{})
 		if err != nil {
 			r.expectations.ValidatingAdmissionPolicy.LowerExpectations(r.kvKey, 1, 0)
-			return fmt.Errorf("unable to create validatingAdmissionPolicy %+v: %v", validatingAdmissionPolicy, err)
+			log.Log.V(2).Infof("failed to create validatingAdmissionPolicy %s: %+v", validatingAdmissionPolicy.Name, validatingAdmissionPolicy)
+			return fmt.Errorf("unable to create validatingAdmissionPolicy %s: %v", validatingAdmissionPolicy.Name, err)
 		}
 
 		return nil
@@ -443,12 +504,14 @@ func (r *Reconciler) createOrUpdateValidatingAdmissionPolicy(validatingAdmission
 	}
 	p, err := patchSet.GeneratePayload()
 	if err != nil {
-		return fmt.Errorf("unable to generate validatingAdmissionPolicy patch operations for %+v: %v", validatingAdmissionPolicy, err)
+		log.Log.V(2).Infof("failed to generate validatingAdmissionPolicy patch for %s: %+v", validatingAdmissionPolicy.Name, validatingAdmissionPolicy)
+		return fmt.Errorf("unable to generate validatingAdmissionPolicy patch operations for %s: %v", validatingAdmissionPolicy.Name, err)
 	}
 
 	_, err = admissionRegistrationV1.ValidatingAdmissionPolicies().Patch(context.Background(), validatingAdmissionPolicy.Name, types.JSONPatchType, p, metav1.PatchOptions{})
 	if err != nil {
-		return fmt.Errorf("unable to patch validatingAdmissionPolicy %+v: %v", validatingAdmissionPolicy, err)
+		log.Log.V(2).Infof("failed to patch validatingAdmissionPolicy %s: %+v", validatingAdmissionPolicy.Name, validatingAdmissionPolicy)
+		return fmt.Errorf("unable to patch validatingAdmissionPolicy %s: %v", validatingAdmissionPolicy.Name, err)
 	}
 
 	log.Log.V(2).Infof("validatingAdmissionPolicy %v patched", validatingAdmissionPolicy.GetName())

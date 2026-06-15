@@ -10,11 +10,13 @@ tests:
   # Alerts to test whether our operators are up or not
   - interval: 1m
     input_series:
-      - series: 'up{namespace="ci", pod="virt-api-1"}'
+      - series: 'kube_pod_status_phase{namespace="ci", pod="virt-api-1", phase="Running"}'
         values: "_ _ _ _ _ _ _ _ _ _ _ 0 0 0 0 0 0 1"
       - series: 'kube_pod_status_phase{namespace="ci", pod="virt-controller-1", phase="Running"}'
         values: "_ _ _ _ _ _ _ _ _ _ _ 0 0 0 0 0 0 1"
-      - series: 'up{namespace="ci", pod="virt-operator-1"}'
+      - series: 'kube_pod_status_phase{namespace="ci", pod="virt-operator-1", phase="Running"}'
+        values: "_ _ _ _ _ _ _ _ _ _ _ 0 0 0 0 0 0 1"
+      - series: 'kube_pod_status_phase{namespace="ci", pod="virt-handler-1", phase="Running"}'
         values: "_ _ _ _ _ _ _ _ _ _ _ 0 0 0 0 0 0 1"
 
     alert_rule_test:
@@ -28,12 +30,15 @@ tests:
       - eval_time: 8m
         alertname: VirtOperatorDown
         exp_alerts: [ ]
+      - eval_time: 8m
+        alertname: VirtHandlerDown
+        exp_alerts: [ ]
       # it must trigger when there is no data
       - eval_time: 10m
         alertname: VirtAPIDown
         exp_alerts:
           - exp_annotations:
-              summary: "All virt-api servers are down."
+              summary: "No running virt-api pods were detected for the last 10 min."
               runbook_url: "https://kubevirt.io/monitoring/runbooks/VirtAPIDown"
             exp_labels:
               severity: "critical"
@@ -55,8 +60,19 @@ tests:
         alertname: VirtOperatorDown
         exp_alerts:
           - exp_annotations:
-              summary: "All virt-operator servers are down."
+              summary: "No running virt-operator pods were detected for the last 10 min."
               runbook_url: "https://kubevirt.io/monitoring/runbooks/VirtOperatorDown"
+            exp_labels:
+              severity: "critical"
+              operator_health_impact: "critical"
+              kubernetes_operator_part_of: "kubevirt"
+              kubernetes_operator_component: "kubevirt"
+      - eval_time: 10m
+        alertname: VirtHandlerDown
+        exp_alerts:
+          - exp_annotations:
+              summary: "No running virt-handler pods were detected for the last 10 min."
+              runbook_url: "https://kubevirt.io/monitoring/runbooks/VirtHandlerDown"
             exp_labels:
               severity: "critical"
               operator_health_impact: "critical"
@@ -67,7 +83,7 @@ tests:
         alertname: VirtAPIDown
         exp_alerts:
           - exp_annotations:
-              summary: "All virt-api servers are down."
+              summary: "No running virt-api pods were detected for the last 10 min."
               runbook_url: "https://kubevirt.io/monitoring/runbooks/VirtAPIDown"
             exp_labels:
               severity: "critical"
@@ -89,8 +105,19 @@ tests:
         alertname: VirtOperatorDown
         exp_alerts:
           - exp_annotations:
-              summary: "All virt-operator servers are down."
+              summary: "No running virt-operator pods were detected for the last 10 min."
               runbook_url: "https://kubevirt.io/monitoring/runbooks/VirtOperatorDown"
+            exp_labels:
+              severity: "critical"
+              operator_health_impact: "critical"
+              kubernetes_operator_part_of: "kubevirt"
+              kubernetes_operator_component: "kubevirt"
+      - eval_time: 16m
+        alertname: VirtHandlerDown
+        exp_alerts:
+          - exp_annotations:
+              summary: "No running virt-handler pods were detected for the last 10 min."
+              runbook_url: "https://kubevirt.io/monitoring/runbooks/VirtHandlerDown"
             exp_labels:
               severity: "critical"
               operator_health_impact: "critical"
@@ -105,6 +132,9 @@ tests:
         exp_alerts: [ ]
       - eval_time: 17m
         alertname: VirtOperatorDown
+        exp_alerts: [ ]
+      - eval_time: 17m
+        alertname: VirtHandlerDown
         exp_alerts: [ ]
 
     # Alert to test when there are VMIs running on a node with an unready virt-handler pod
@@ -144,7 +174,7 @@ tests:
             exp_labels:
               node: "node01"
               severity: "warning"
-              operator_health_impact: "none"
+              operator_health_impact: "warning"
               kubernetes_operator_part_of: "kubevirt"
               kubernetes_operator_component: "kubevirt"
 
@@ -186,7 +216,7 @@ tests:
             exp_labels:
               node: "node01"
               severity: "warning"
-              operator_health_impact: "none"
+              operator_health_impact: "warning"
               kubernetes_operator_part_of: "kubevirt"
               kubernetes_operator_component: "kubevirt"
 
@@ -201,6 +231,10 @@ tests:
         values: '1+0x11'
       - series: 'kube_pod_status_phase{namespace="ci", pod="virt-controller-2", phase="Running"}'
         values: '1+0x11'
+      - series: 'kube_pod_status_ready{namespace="ci", pod="virt-controller-1", condition="true"}'
+        values: '1+0x11'
+      - series: 'kube_pod_status_ready{namespace="ci", pod="virt-controller-2", condition="true"}'
+        values: '0+0x11'
 
     alert_rule_test:
       - eval_time: 10m
@@ -215,10 +249,159 @@ tests:
               kubernetes_operator_part_of: "kubevirt"
               kubernetes_operator_component: "kubevirt"
 
+  # Some virt operators are not ready
+  - interval: 1m
+    input_series:
+      - series: 'kubevirt_virt_operator_ready_status{namespace="ci", pod="virt-operator-1"}'
+        values: '1+0x11'
+      - series: 'kubevirt_virt_operator_ready_status{namespace="ci", pod="virt-operator-2"}'
+        values: '0+0x11'
+      - series: 'kube_pod_status_phase{namespace="ci", pod="virt-operator-1", phase="Running"}'
+        values: '1+0x11'
+      - series: 'kube_pod_status_phase{namespace="ci", pod="virt-operator-2", phase="Running"}'
+        values: '1+0x11'
+      - series: 'kube_pod_status_ready{namespace="ci", pod="virt-operator-1", condition="true"}'
+        values: '1+0x11'
+      - series: 'kube_pod_status_ready{namespace="ci", pod="virt-operator-2", condition="true"}'
+        values: '0+0x11'
+
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: LowReadyVirtOperatorsCount
+        exp_alerts:
+          - exp_annotations:
+              summary: "Some virt-operators are running but not ready."
+              runbook_url: "https://kubevirt.io/monitoring/runbooks/LowReadyVirtOperatorsCount"
+            exp_labels:
+              severity: "warning"
+              operator_health_impact: "warning"
+              kubernetes_operator_part_of: "kubevirt"
+              kubernetes_operator_component: "kubevirt"
+
+  # Some virt-api pods are not ready
+  - interval: 1m
+    input_series:
+      - series: 'kubevirt_virt_api_ready_status{namespace="ci", pod="virt-api-1"}'
+        values: '1+0x11'
+      - series: 'kubevirt_virt_api_ready_status{namespace="ci", pod="virt-api-2"}'
+        values: '0+0x11'
+      - series: 'kube_pod_status_phase{namespace="ci", pod="virt-api-1", phase="Running"}'
+        values: '1+0x11'
+      - series: 'kube_pod_status_phase{namespace="ci", pod="virt-api-2", phase="Running"}'
+        values: '1+0x11'
+      - series: 'kube_pod_status_ready{namespace="ci", pod="virt-api-1", condition="true"}'
+        values: '1+0x11'
+      - series: 'kube_pod_status_ready{namespace="ci", pod="virt-api-2", condition="true"}'
+        values: '0+0x11'
+
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: LowReadyVirtAPICount
+        exp_alerts:
+          - exp_annotations:
+              summary: "Some virt-api pods are running but not ready."
+              runbook_url: "https://kubevirt.io/monitoring/runbooks/LowReadyVirtAPICount"
+            exp_labels:
+              severity: "warning"
+              operator_health_impact: "warning"
+              kubernetes_operator_part_of: "kubevirt"
+              kubernetes_operator_component: "kubevirt"
+
+  # All virt-api are not ready
+  - interval: 1m
+    input_series:
+      - series: 'kubevirt_virt_api_ready_status{namespace="ci", pod="virt-api-1"}'
+        values: "0 0 0 0 0 0 0 0 0 0 0"
+      - series: 'kube_pod_status_phase{namespace="ci", pod="virt-api-1", phase="Running"}'
+        values: "1 1 1 1 1 1 1 1 1 1 1"
+      - series: 'kube_pod_status_ready{namespace="ci", pod="virt-api-1", condition="true"}'
+        values: "0 0 0 0 0 0 0 0 0 0 0"
+
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: NoReadyVirtAPI
+        exp_alerts: [ ]
+      - eval_time: 10m
+        alertname: NoReadyVirtAPI
+        exp_alerts:
+          - exp_annotations:
+              summary: "No ready virt-api was detected for the last 10 min."
+              runbook_url: "https://kubevirt.io/monitoring/runbooks/NoReadyVirtAPI"
+            exp_labels:
+              severity: "critical"
+              operator_health_impact: "critical"
+              kubernetes_operator_part_of: "kubevirt"
+              kubernetes_operator_component: "kubevirt"
+      - eval_time: 10m
+        alertname: LowReadyVirtAPICount
+        exp_alerts: [ ]
+
+  # Some virt-handlers are not ready
+  - interval: 1m
+    input_series:
+      - series: 'kubevirt_virt_handler_ready_status{namespace="ci", pod="virt-handler-1"}'
+        values: '1+0x11'
+      - series: 'kubevirt_virt_handler_ready_status{namespace="ci", pod="virt-handler-2"}'
+        values: '0+0x11'
+      - series: 'kube_pod_status_phase{namespace="ci", pod="virt-handler-1", phase="Running"}'
+        values: '1+0x11'
+      - series: 'kube_pod_status_phase{namespace="ci", pod="virt-handler-2", phase="Running"}'
+        values: '1+0x11'
+      - series: 'kube_pod_status_ready{namespace="ci", pod="virt-handler-1", condition="true"}'
+        values: '1+0x11'
+      - series: 'kube_pod_status_ready{namespace="ci", pod="virt-handler-2", condition="true"}'
+        values: '0+0x11'
+
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: LowReadyVirtHandlerCount
+        exp_alerts:
+          - exp_annotations:
+              summary: "Some virt-handlers are running but not ready."
+              runbook_url: "https://kubevirt.io/monitoring/runbooks/LowReadyVirtHandlerCount"
+            exp_labels:
+              severity: "warning"
+              operator_health_impact: "warning"
+              kubernetes_operator_part_of: "kubevirt"
+              kubernetes_operator_component: "kubevirt"
+
+  # All virt-handlers are not ready
+  - interval: 1m
+    input_series:
+      - series: 'kubevirt_virt_handler_ready_status{namespace="ci", pod="virt-handler-1"}'
+        values: "0 0 0 0 0 0 0 0 0 0 0"
+      - series: 'kube_pod_status_phase{namespace="ci", pod="virt-handler-1", phase="Running"}'
+        values: "1 1 1 1 1 1 1 1 1 1 1"
+      - series: 'kube_pod_status_ready{namespace="ci", pod="virt-handler-1", condition="true"}'
+        values: "0 0 0 0 0 0 0 0 0 0 0"
+
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: NoReadyVirtHandler
+        exp_alerts: [ ]
+      - eval_time: 10m
+        alertname: NoReadyVirtHandler
+        exp_alerts:
+          - exp_annotations:
+              summary: "No ready virt-handler was detected for the last 10 min."
+              runbook_url: "https://kubevirt.io/monitoring/runbooks/NoReadyVirtHandler"
+            exp_labels:
+              severity: "critical"
+              operator_health_impact: "critical"
+              kubernetes_operator_part_of: "kubevirt"
+              kubernetes_operator_component: "kubevirt"
+      - eval_time: 10m
+        alertname: LowReadyVirtHandlerCount
+        exp_alerts: [ ]
+
   # All virt controllers are not ready
   - interval: 1m
     input_series:
       - series: 'kubevirt_virt_controller_ready_status{namespace="ci", pod="virt-controller-1"}'
+        values: "0 0 0 0 0 0 0 0 0 0 0"
+      - series: 'kube_pod_status_phase{namespace="ci", pod="virt-controller-1", phase="Running"}'
+        values: "1 1 1 1 1 1 1 1 1 1 1"
+      - series: 'kube_pod_status_ready{namespace="ci", pod="virt-controller-1", condition="true"}'
         values: "0 0 0 0 0 0 0 0 0 0 0"
 
     alert_rule_test:
@@ -237,6 +420,9 @@ tests:
               operator_health_impact: "critical"
               kubernetes_operator_part_of: "kubevirt"
               kubernetes_operator_component: "kubevirt"
+      - eval_time: 10m
+        alertname: LowReadyVirtControllersCount
+        exp_alerts: [ ]
 
   # All virt controllers are not ready (ImagePullBackOff)
   - interval: 1m
@@ -293,6 +479,8 @@ tests:
         values: "0x10"
       - series: 'kube_pod_status_ready{namespace="ci", pod="virt-operator-1"}'
         values: "0x10"
+      - series: 'kube_pod_status_phase{namespace="ci", pod="virt-operator-1", phase="Running"}'
+        values: "1x10"
 
     alert_rule_test:
       # no alert before 10 minutes
@@ -310,6 +498,9 @@ tests:
               operator_health_impact: "critical"
               kubernetes_operator_part_of: "kubevirt"
               kubernetes_operator_component: "kubevirt"
+      - eval_time: 10m
+        alertname: LowReadyVirtOperatorsCount
+        exp_alerts: [ ]
 
   # All virt operators are not ready, according to kubevirt_virt_operator_ready_status
   - interval: 1m
@@ -318,6 +509,8 @@ tests:
         values: "0x10"
       - series: 'kube_pod_status_ready{namespace="ci", pod="virt-operator-1"}'
         values: "1x10"
+      - series: 'kube_pod_status_phase{namespace="ci", pod="virt-operator-1", phase="Running"}'
+        values: "1x10"
 
     alert_rule_test:
       # no alert before 10 minutes
@@ -335,6 +528,9 @@ tests:
               operator_health_impact: "critical"
               kubernetes_operator_part_of: "kubevirt"
               kubernetes_operator_component: "kubevirt"
+      - eval_time: 10m
+        alertname: LowReadyVirtOperatorsCount
+        exp_alerts: [ ]
 
   # All virt operators are not ready, according to kube_pod_status_ready
   - interval: 1m
@@ -343,6 +539,8 @@ tests:
         values: "1x10"
       - series: 'kube_pod_status_ready{namespace="ci", pod="virt-operator-1", condition="true"}'
         values: "0x10"
+      - series: 'kube_pod_status_phase{namespace="ci", pod="virt-operator-1", phase="Running"}'
+        values: "1x10"
 
     alert_rule_test:
       # no alert before 10 minutes
@@ -360,6 +558,9 @@ tests:
               operator_health_impact: "critical"
               kubernetes_operator_part_of: "kubevirt"
               kubernetes_operator_component: "kubevirt"
+      - eval_time: 10m
+        alertname: LowReadyVirtOperatorsCount
+        exp_alerts: [ ]
 
   # virt operator is ready, according to both metrics
   - interval: 1m
@@ -454,13 +655,13 @@ tests:
   # Some nodes without KVM resources
   - interval: 1m
     input_series:
-      - series: 'kube_node_status_allocatable{resource="devices_kubevirt_io_kvm", node ="node1"}'
-        values: "110 110 110 110 110 110"
-      - series: 'kube_node_status_allocatable{resource="devices_kubevirt_io_kvm", node ="node2 "}'
-        values: "0 0 0 0 0 0"
+      - series: 'kube_node_status_allocatable{resource="devices_kubevirt_io_kvm", node="node1"}'
+        values: "110 110 110 110 110 110 110"
+      - series: 'kube_node_status_allocatable{resource="devices_kubevirt_io_kvm", node="node2"}'
+        values: "0 0 0 0 0 0 0"
 
     alert_rule_test:
-      - eval_time: 5m
+      - eval_time: 6m
         alertname: LowKVMNodesCount
         exp_alerts:
           - exp_annotations:
@@ -476,13 +677,13 @@ tests:
   # All nodes without KVM resources
   - interval: 1m
     input_series:
-      - series: 'kube_node_status_allocatable{resource="devices_kubevirt_io_kvm", node ="node1"}'
-        values: "0 0 0 0 0 0"
-      - series: 'kube_node_status_allocatable{resource="devices_kubevirt_io_kvm", node ="node2 "}'
-        values: "0 0 0 0 0 0"
+      - series: 'kube_node_status_allocatable{resource="devices_kubevirt_io_kvm", node="node1"}'
+        values: "0 0 0 0 0 0 0"
+      - series: 'kube_node_status_allocatable{resource="devices_kubevirt_io_kvm", node="node2"}'
+        values: "0 0 0 0 0 0 0"
 
     alert_rule_test:
-      - eval_time: 5m
+      - eval_time: 6m
         alertname: LowKVMNodesCount
         exp_alerts:
           - exp_annotations:
@@ -498,9 +699,9 @@ tests:
   # Two nodes with KVM resources
   - interval: 1m
     input_series:
-      - series: 'kube_node_status_allocatable{resource="devices_kubevirt_io_kvm", node ="node1"}'
+      - series: 'kube_node_status_allocatable{resource="devices_kubevirt_io_kvm", node="node1"}'
         values: "110 110 110 110 110 110"
-      - series: 'kube_node_status_allocatable{resource="devices_kubevirt_io_kvm", node ="node2 "}'
+      - series: 'kube_node_status_allocatable{resource="devices_kubevirt_io_kvm", node="node2"}'
         values: "110 110 110 110 110 110"
 
     alert_rule_test:
@@ -521,15 +722,15 @@ tests:
         # time:  0          1          2          3
         values: "1073176576 1073176576 1073176576 1273176576"
     promql_expr_test:
-      - expr: 'kubevirt_vm_container_memory_request_margin_based_on_working_set_bytes'
+      - expr: 'pod_container:kubevirt_vm_memory_request_margin_based_on_working_set_bytes:sum'
         eval_time: 1m
         exp_samples:
-          - labels: 'kubevirt_vm_container_memory_request_margin_based_on_working_set_bytes{pod="virt-launcher-example-1", namespace="namespace-example-1",container="compute"}'
+          - labels: 'pod_container:kubevirt_vm_memory_request_margin_based_on_working_set_bytes:sum{pod="virt-launcher-example-1", namespace="namespace-example-1",container="compute"}'
             value: 303706112
-      - expr: 'kubevirt_vm_container_memory_request_margin_based_on_working_set_bytes'
+      - expr: 'pod_container:kubevirt_vm_memory_request_margin_based_on_working_set_bytes:sum'
         eval_time: 3m
         exp_samples:
-          - labels: 'kubevirt_vm_container_memory_request_margin_based_on_working_set_bytes{pod="virt-launcher-example-1", namespace="namespace-example-1",container="compute"}'
+          - labels: 'pod_container:kubevirt_vm_memory_request_margin_based_on_working_set_bytes:sum{pod="virt-launcher-example-1", namespace="namespace-example-1",container="compute"}'
             value: 103706112
   # VM eviction strategy is set but vm is not migratable
   - interval: 1m
@@ -583,15 +784,15 @@ tests:
       - series: 'kube_pod_container_resource_requests{pod="virt-launcher-foo-1", namespace="ns-a", container="compute", resource="memory"}'
         values: '1000 1000'
     promql_expr_test:
-      - expr: 'kubevirt_memory_delta_from_requested_bytes{reason="memory_working_set_delta_from_request"}'
+      - expr: 'container:kubevirt_memory_delta_from_requested_bytes:max{reason="memory_working_set_delta_from_request"}'
         eval_time: 1m
         exp_samples:
-          - labels: 'kubevirt_memory_delta_from_requested_bytes{container="compute",namespace="ns-a",pod="virt-launcher-foo-1",reason="memory_working_set_delta_from_request"}'
+          - labels: 'container:kubevirt_memory_delta_from_requested_bytes:max{container="compute",namespace="ns-a",pod="virt-launcher-foo-1",reason="memory_working_set_delta_from_request"}'
             value: 500
-      - expr: 'kubevirt_memory_delta_from_requested_bytes{reason="memory_rss_delta_from_request"}'
+      - expr: 'container:kubevirt_memory_delta_from_requested_bytes:max{reason="memory_rss_delta_from_request"}'
         eval_time: 1m
         exp_samples:
-          - labels: 'kubevirt_memory_delta_from_requested_bytes{container="compute",namespace="ns-a",pod="virt-launcher-foo-1",reason="memory_rss_delta_from_request"}'
+          - labels: 'container:kubevirt_memory_delta_from_requested_bytes:max{container="compute",namespace="ns-a",pod="virt-launcher-foo-1",reason="memory_rss_delta_from_request"}'
             value: 200
 
   # Test recording rule
@@ -612,19 +813,19 @@ tests:
         # time:  0          1          2          3
         values: "2448936960 2448936960 2448936960 2658936964"
     promql_expr_test:
-      - expr: 'kubevirt_vmi_memory_used_bytes'
+      - expr: 'vmi:kubevirt_vmi_memory_used_bytes:sum'
         eval_time: 1m
         exp_samples:
-          - labels: 'kubevirt_vmi_memory_used_bytes{container="virt-handler", name="vm-example-1", namespace="default", node="node-1"}'
+          - labels: 'vmi:kubevirt_vmi_memory_used_bytes:sum{container="virt-handler", name="vm-example-1", namespace="default", node="node-1"}'
             value: 303706112
-          - labels: 'kubevirt_vmi_memory_used_bytes{container="virt-handler", name="vm-example-2", namespace="default", node="node-1"}'
+          - labels: 'vmi:kubevirt_vmi_memory_used_bytes:sum{container="virt-handler", name="vm-example-2", namespace="default", node="node-1"}'
             value: 444329984
-      - expr: 'kubevirt_vmi_memory_used_bytes'
+      - expr: 'vmi:kubevirt_vmi_memory_used_bytes:sum'
         eval_time: 3m
         exp_samples:
-          - labels: 'kubevirt_vmi_memory_used_bytes{container="virt-handler", name="vm-example-1", namespace="default", node="node-1"}'
+          - labels: 'vmi:kubevirt_vmi_memory_used_bytes:sum{container="virt-handler", name="vm-example-1", namespace="default", node="node-1"}'
             value: 103706112
-          - labels: 'kubevirt_vmi_memory_used_bytes{container="virt-handler", name="vm-example-2", namespace="default", node="node-1"}'
+          - labels: 'vmi:kubevirt_vmi_memory_used_bytes:sum{container="virt-handler", name="vm-example-2", namespace="default", node="node-1"}'
             value: 234329980
 
   # Mass Failed virt-launcher pods should trigger critical alert after 10m
@@ -890,6 +1091,25 @@ tests:
         alertname: KubeVirtDeprecatedAPIRequested
         exp_alerts: []
 
+  # Deprecated APIs being requested should not fire for LIST, WATCH, or DELETE verbs.
+  - interval: 1m
+    input_series:
+      - series: 'apiserver_requested_deprecated_apis{resource="virtualmachines", group="kubevirt.io", version="v1alpha3"}'
+        values: '0 0 1'
+      - series: 'apiserver_request_total{resource="virtualmachines", group="kubevirt.io", version="v1alpha3", verb="LIST"}'
+        values: '0 0 1 2'
+      - series: 'apiserver_request_total{resource="virtualmachines", group="kubevirt.io", version="v1alpha3", verb="WATCH"}'
+        values: '0 0 1 2'
+      - series: 'apiserver_request_total{resource="virtualmachines", group="kubevirt.io", version="v1alpha3", verb="DELETE"}'
+        values: '0 0 1 2'
+
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: KubeVirtDeprecatedAPIRequested
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: KubeVirtDeprecatedAPIRequested
+        exp_alerts: []
 
   # VMI CPU Queue higher than 20
   - interval: 1m
@@ -1024,28 +1244,41 @@ tests:
       # VMs that SHOULD alert (in problematic states with VMI)
       - series: 'kubevirt_vm_info{name="vm-stuck-starting", namespace="test-ns", status="starting", status_group="starting"}'
         values: "1x11"
-      - series: 'kubevirt_vmi_info{name="vm-stuck-starting", namespace="test-ns", node="worker-node-1"}'
+      - series: 'kubevirt_vmi_info{name="vm-stuck-starting", namespace="test-ns", node="worker-node-1", phase="running"}'
         values: "1x11"
       - series: 'kubevirt_vm_info{name="vm-image-error", namespace="test-ns", status="ErrImagePull", status_group="error"}'
         values: "1x11"
-      - series: 'kubevirt_vmi_info{name="vm-image-error", namespace="test-ns", node="worker-node-2"}'
+      - series: 'kubevirt_vmi_info{name="vm-image-error", namespace="test-ns", node="worker-node-2", phase="running"}'
         values: "1x11"
       - series: 'kubevirt_vm_info{name="vm-stuck-stopping", namespace="test-ns", status="stopping", status_group="non_running"}'
         values: "1x11"
-      - series: 'kubevirt_vmi_info{name="vm-stuck-stopping", namespace="test-ns", node="worker-node-3"}'
+      - series: 'kubevirt_vmi_info{name="vm-stuck-stopping", namespace="test-ns", node="worker-node-3", phase="running"}'
         values: "1x11"
       - series: 'kubevirt_vm_info{name="vm-terminating-with-vmi", namespace="test-ns", status="terminating", status_group="non_running"}'
         values: "1x11"
-      - series: 'kubevirt_vmi_info{name="vm-terminating-with-vmi", namespace="test-ns", node="worker-node-4"}'
+      - series: 'kubevirt_vmi_info{name="vm-terminating-with-vmi", namespace="test-ns", node="worker-node-4", phase="scheduled"}'
         values: "1x11"
       # VMs that should NOT alert (in healthy states with VMI)
       - series: 'kubevirt_vm_info{name="vm-running", namespace="test-ns", status="running", status_group="running"}'
         values: "1x11"
-      - series: 'kubevirt_vmi_info{name="vm-running", namespace="test-ns", node="worker-node-5"}'
+      - series: 'kubevirt_vmi_info{name="vm-running", namespace="test-ns", node="worker-node-5", phase="running"}'
         values: "1x11"
       - series: 'kubevirt_vm_info{name="vm-paused", namespace="test-ns", status="paused", status_group="running"}'
         values: "1x11"
-      - series: 'kubevirt_vmi_info{name="vm-paused", namespace="test-ns", node="worker-node-6"}'
+      - series: 'kubevirt_vmi_info{name="vm-paused", namespace="test-ns", node="worker-node-6", phase="scheduled"}'
+        values: "1x11"
+      # VMs that should NOT alert (problematic status but no VMI)
+      - series: 'kubevirt_vm_info{name="vm-starting-no-vmi", namespace="test-ns", status="starting", status_group="starting"}'
+        values: "1x11"
+      # VMs that should NOT alert (problematic status but VMI in non-matching phase)
+      - series: 'kubevirt_vm_info{name="vm-starting-pending-vmi", namespace="test-ns", status="starting", status_group="starting"}'
+        values: "1x11"
+      - series: 'kubevirt_vmi_info{name="vm-starting-pending-vmi", namespace="test-ns", node="worker-node-11", phase="pending"}'
+        values: "1x11"
+      # VMs that should NOT alert (error status but VMI in non-matching phase)
+      - series: 'kubevirt_vm_info{name="vm-error-failed-vmi", namespace="test-ns", status="CrashLoopBackOff", status_group="error"}'
+        values: "1x11"
+      - series: 'kubevirt_vmi_info{name="vm-error-failed-vmi", namespace="test-ns", node="worker-node-12", phase="failed"}'
         values: "1x11"
 
     alert_rule_test:
@@ -1109,6 +1342,151 @@ tests:
               namespace: "test-ns"
               status: "terminating"
               node: "worker-node-4"
+
+  # VirtualMachineStuckOnNode - duplicate VMI series regression tests
+  # Verifies topk-based dedup prevents many-to-many matching errors
+  # during VMI phase transitions and live migrations.
+  - interval: 1m
+    input_series:
+      # Phase transition: scheduling + running VMI coexist for same VM
+      - series: 'kubevirt_vm_info{name="vm-phase-overlap", namespace="test-ns", status="starting", status_group="starting"}'
+        values: "1x11"
+      - series: 'kubevirt_vmi_info{name="vm-phase-overlap", namespace="test-ns", phase="scheduling"}'
+        values: "1x11"
+      - series: 'kubevirt_vmi_info{name="vm-phase-overlap", namespace="test-ns", phase="running", node="worker-node-7"}'
+        values: "1x11"
+      # Scheduled phase: VMI bound to node but domain not yet started
+      - series: 'kubevirt_vm_info{name="vm-stuck-scheduled", namespace="test-ns", status="starting", status_group="starting"}'
+        values: "1x11"
+      - series: 'kubevirt_vmi_info{name="vm-stuck-scheduled", namespace="test-ns", phase="scheduled", node="worker-node-8"}'
+        values: "1x11"
+      # Scheduled + running overlap: both phases match filter, topk must dedup
+      # topk picks the higher-valued series deterministically
+      - series: 'kubevirt_vm_info{name="vm-sched-run-overlap", namespace="test-ns", status="starting", status_group="starting"}'
+        values: "1x11"
+      - series: 'kubevirt_vmi_info{name="vm-sched-run-overlap", namespace="test-ns", phase="scheduled", node="worker-node-9"}'
+        values: "1x11"
+      - series: 'kubevirt_vmi_info{name="vm-sched-run-overlap", namespace="test-ns", phase="running", node="worker-node-10"}'
+        values: "2x11"
+      # Migration: two running VMIs on different nodes for same VM
+      # topk picks the higher-valued series deterministically
+      - series: 'kubevirt_vm_info{name="vm-migration-overlap", namespace="test-ns", status="stopping", status_group="non_running"}'
+        values: "1x11"
+      - series: 'kubevirt_vmi_info{name="vm-migration-overlap", namespace="test-ns", phase="running", node="source-node"}'
+        values: "2x11"
+      - series: 'kubevirt_vmi_info{name="vm-migration-overlap", namespace="test-ns", phase="running", node="target-node"}'
+        values: "1x11"
+      # Error with migration overlap: tests inner and + outer group_left
+      - series: 'kubevirt_vm_info{name="vm-error-migration", namespace="test-ns", status="ErrImagePull", status_group="error"}'
+        values: "1x11"
+      - series: 'kubevirt_vmi_info{name="vm-error-migration", namespace="test-ns", phase="running", node="source-node-2"}'
+        values: "2x11"
+      - series: 'kubevirt_vmi_info{name="vm-error-migration", namespace="test-ns", phase="running", node="target-node-2"}'
+        values: "1x11"
+
+    alert_rule_test:
+      # no alert before 5 minutes
+      - eval_time: 4m
+        alertname: VirtualMachineStuckOnNode
+        exp_alerts: []
+      # alerts fire after 5 minutes; topk dedup ensures no many-to-many errors
+      - eval_time: 5m
+        alertname: VirtualMachineStuckOnNode
+        exp_alerts:
+          - exp_annotations:
+              summary: "Virtual machine stuck in unhealthy state for more than 5 minutes"
+              description: "Virtual machine vm-phase-overlap in namespace test-ns on node worker-node-7 has been in starting state for more than 5 minutes. This may indicate issues with the VM lifecycle on the target node."
+              runbook_url: "https://kubevirt.io/monitoring/runbooks/VirtualMachineStuckOnNode"
+            exp_labels:
+              severity: "warning"
+              operator_health_impact: "none"
+              kubernetes_operator_part_of: "kubevirt"
+              kubernetes_operator_component: "kubevirt"
+              name: "vm-phase-overlap"
+              namespace: "test-ns"
+              status: "starting"
+              node: "worker-node-7"
+          - exp_annotations:
+              summary: "Virtual machine stuck in unhealthy state for more than 5 minutes"
+              description: "Virtual machine vm-stuck-scheduled in namespace test-ns on node worker-node-8 has been in starting state for more than 5 minutes. This may indicate issues with the VM lifecycle on the target node."
+              runbook_url: "https://kubevirt.io/monitoring/runbooks/VirtualMachineStuckOnNode"
+            exp_labels:
+              severity: "warning"
+              operator_health_impact: "none"
+              kubernetes_operator_part_of: "kubevirt"
+              kubernetes_operator_component: "kubevirt"
+              name: "vm-stuck-scheduled"
+              namespace: "test-ns"
+              status: "starting"
+              node: "worker-node-8"
+          - exp_annotations:
+              summary: "Virtual machine stuck in unhealthy state for more than 5 minutes"
+              description: "Virtual machine vm-sched-run-overlap in namespace test-ns on node worker-node-10 has been in starting state for more than 5 minutes. This may indicate issues with the VM lifecycle on the target node."
+              runbook_url: "https://kubevirt.io/monitoring/runbooks/VirtualMachineStuckOnNode"
+            exp_labels:
+              severity: "warning"
+              operator_health_impact: "none"
+              kubernetes_operator_part_of: "kubevirt"
+              kubernetes_operator_component: "kubevirt"
+              name: "vm-sched-run-overlap"
+              namespace: "test-ns"
+              status: "starting"
+              node: "worker-node-10"
+          - exp_annotations:
+              summary: "Virtual machine stuck in unhealthy state for more than 5 minutes"
+              description: "Virtual machine vm-error-migration in namespace test-ns on node source-node-2 has been in ErrImagePull state for more than 5 minutes. This may indicate issues with the VM lifecycle on the target node."
+              runbook_url: "https://kubevirt.io/monitoring/runbooks/VirtualMachineStuckOnNode"
+            exp_labels:
+              severity: "warning"
+              operator_health_impact: "none"
+              kubernetes_operator_part_of: "kubevirt"
+              kubernetes_operator_component: "kubevirt"
+              name: "vm-error-migration"
+              namespace: "test-ns"
+              status: "ErrImagePull"
+              node: "source-node-2"
+          - exp_annotations:
+              summary: "Virtual machine stuck in unhealthy state for more than 5 minutes"
+              description: "Virtual machine vm-migration-overlap in namespace test-ns on node source-node has been in stopping state for more than 5 minutes. This may indicate issues with the VM lifecycle on the target node."
+              runbook_url: "https://kubevirt.io/monitoring/runbooks/VirtualMachineStuckOnNode"
+            exp_labels:
+              severity: "warning"
+              operator_health_impact: "none"
+              kubernetes_operator_part_of: "kubevirt"
+              kubernetes_operator_component: "kubevirt"
+              name: "vm-migration-overlap"
+              namespace: "test-ns"
+              status: "stopping"
+              node: "source-node"
+
+  # VMCannotBeEvicted - duplicate VMI series regression test
+  # Verifies topk-based dedup prevents many-to-many matching errors
+  # when two running VMI series exist during live migration.
+  - interval: 1m
+    input_series:
+      - series: 'kubevirt_vmi_non_evictable{node="node1", namespace="ns-test", name="vm-evict-migration"}'
+        values: "1 1 1 1 1 1 1 1"
+      - series: 'kubevirt_vmi_info{phase="running", node="node1", namespace="ns-test", name="vm-evict-migration"}'
+        values: "1 1 1 1 1 1 1 1"
+      - series: 'kubevirt_vmi_info{phase="running", node="node2", namespace="ns-test", name="vm-evict-migration"}'
+        values: "1 1 1 1 1 1 1 1"
+
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: VMCannotBeEvicted
+        exp_alerts:
+          - exp_annotations:
+              description: "Eviction policy for VirtualMachine vm-evict-migration in namespace ns-test (on node node1) is set to Live Migration but the VM is not migratable"
+              summary: "The VM's eviction strategy is set to Live Migration but the VM is not migratable"
+              runbook_url: "https://kubevirt.io/monitoring/runbooks/VMCannotBeEvicted"
+            exp_labels:
+              severity: "warning"
+              operator_health_impact: "none"
+              kubernetes_operator_part_of: "kubevirt"
+              kubernetes_operator_component: "kubevirt"
+              name: "vm-evict-migration"
+              namespace: "ns-test"
+              node: "node1"
 
   # GuestFilesystemAlmostOutOfSpace - Warning (85% usage)
   - interval: 1m
@@ -1378,3 +1756,132 @@ tests:
               name: "virt-launcher-vm2"
               vm: "vm2"
               namespace: "test-ns"
+
+  # LowVirtAPICount - should fire when less than 75% of desired virt-api pods are running
+  - interval: 1m
+    input_series:
+      - series: 'up{namespace="ci", pod="virt-api-1"}'
+        values: '1+0x61'
+      - series: 'kube_deployment_spec_replicas{deployment="virt-api", namespace="ci"}'
+        values: '4+0x61'
+
+    alert_rule_test:
+      # should not fire before 60m
+      - eval_time: 59m
+        alertname: LowVirtAPICount
+        exp_alerts: []
+      # should fire at 60m (1 out of 4 pods running = 25% < 75%)
+      - eval_time: 60m
+        alertname: LowVirtAPICount
+        exp_alerts:
+          - exp_annotations:
+              summary: "Less than 75% of desired virt-api pods are running."
+              runbook_url: "https://kubevirt.io/monitoring/runbooks/LowVirtAPICount"
+            exp_labels:
+              severity: "warning"
+              operator_health_impact: "warning"
+              kubernetes_operator_part_of: "kubevirt"
+              kubernetes_operator_component: "kubevirt"
+
+  # LowVirtAPICount - should not fire when 75% or more of desired virt-api pods are running
+  - interval: 1m
+    input_series:
+      - series: 'up{namespace="ci", pod="virt-api-1"}'
+        values: '1+0x61'
+      - series: 'up{namespace="ci", pod="virt-api-2"}'
+        values: '1+0x61'
+      - series: 'up{namespace="ci", pod="virt-api-3"}'
+        values: '1+0x61'
+      - series: 'kube_deployment_spec_replicas{deployment="virt-api", namespace="ci"}'
+        values: '4+0x61'
+
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: LowVirtAPICount
+        exp_alerts: []
+
+  # LowVirtControllersCount - should fire when less than 75% of desired virt-controller pods are up
+  - interval: 1m
+    input_series:
+      - series: 'up{namespace="ci", pod="virt-controller-1"}'
+        values: '1+0x11'
+      - series: 'kube_deployment_spec_replicas{deployment="virt-controller", namespace="ci"}'
+        values: '4+0x11'
+
+    alert_rule_test:
+      # should not fire before 10m
+      - eval_time: 9m
+        alertname: LowVirtControllersCount
+        exp_alerts: []
+      # should fire at 10m (1 out of 4 pods up = 25% < 75%)
+      - eval_time: 10m
+        alertname: LowVirtControllersCount
+        exp_alerts:
+          - exp_annotations:
+              summary: "Less than 75% of desired virt-controller pods are ready."
+              runbook_url: "https://kubevirt.io/monitoring/runbooks/LowVirtControllersCount"
+            exp_labels:
+              severity: "warning"
+              operator_health_impact: "warning"
+              kubernetes_operator_part_of: "kubevirt"
+              kubernetes_operator_component: "kubevirt"
+
+  # LowVirtControllersCount - should not fire when 75% or more of desired virt-controller pods are up
+  - interval: 1m
+    input_series:
+      - series: 'up{namespace="ci", pod="virt-controller-1"}'
+        values: '1+0x11'
+      - series: 'up{namespace="ci", pod="virt-controller-2"}'
+        values: '1+0x11'
+      - series: 'up{namespace="ci", pod="virt-controller-3"}'
+        values: '1+0x11'
+      - series: 'kube_deployment_spec_replicas{deployment="virt-controller", namespace="ci"}'
+        values: '4+0x11'
+
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: LowVirtControllersCount
+        exp_alerts: []
+
+  # LowVirtOperatorCount - should fire when less than 75% of desired virt-operator pods are running
+  - interval: 1m
+    input_series:
+      - series: 'up{namespace="ci", pod="virt-operator-1"}'
+        values: '1+0x61'
+      - series: 'kube_deployment_spec_replicas{deployment="virt-operator", namespace="ci"}'
+        values: '4+0x61'
+
+    alert_rule_test:
+      # should not fire before 60m
+      - eval_time: 59m
+        alertname: LowVirtOperatorCount
+        exp_alerts: []
+      # should fire at 60m (1 out of 4 pods running = 25% < 75%)
+      - eval_time: 60m
+        alertname: LowVirtOperatorCount
+        exp_alerts:
+          - exp_annotations:
+              summary: "Less than 75% of desired virt-operator pods are running."
+              runbook_url: "https://kubevirt.io/monitoring/runbooks/LowVirtOperatorCount"
+            exp_labels:
+              severity: "warning"
+              operator_health_impact: "warning"
+              kubernetes_operator_part_of: "kubevirt"
+              kubernetes_operator_component: "kubevirt"
+
+  # LowVirtOperatorCount - should not fire when 75% or more of desired virt-operator pods are running
+  - interval: 1m
+    input_series:
+      - series: 'up{namespace="ci", pod="virt-operator-1"}'
+        values: '1+0x61'
+      - series: 'up{namespace="ci", pod="virt-operator-2"}'
+        values: '1+0x61'
+      - series: 'up{namespace="ci", pod="virt-operator-3"}'
+        values: '1+0x61'
+      - series: 'kube_deployment_spec_replicas{deployment="virt-operator", namespace="ci"}'
+        values: '4+0x61'
+
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: LowVirtOperatorCount
+        exp_alerts: []

@@ -47,7 +47,7 @@ import (
 	"kubevirt.io/kubevirt/tests/testsuite"
 )
 
-var _ = Describe("[sig-monitoring]Monitoring", Serial, decorators.SigMonitoring, func() {
+var _ = Describe("[sig-monitoring]Monitoring", decorators.SigMonitoring, func() {
 	var err error
 	var virtClient kubecli.KubevirtClient
 	var prometheusRule *promv1.PrometheusRule
@@ -107,11 +107,11 @@ var _ = Describe("[sig-monitoring]Monitoring", Serial, decorators.SigMonitoring,
 			Expect(virtClient.VirtualMachineInstance(vmi.Namespace).Delete(context.Background(), vmi.Name, metav1.DeleteOptions{})).To(Succeed())
 
 			By("Waiting for VMI to disappear")
-			libwait.WaitForVirtualMachineToDisappearWithTimeout(vmi, 240)
+			Expect(libwait.WaitForVirtualMachineToDisappearWithTimeout(vmi, 240*time.Second)).To(Succeed())
 		})
 	})
 
-	Context("System Alerts", func() {
+	Context("System Alerts", Serial, func() {
 		It("KubeVirtNoAvailableNodesToRunVMs should be triggered when there are no available nodes in the cluster to run VMs", func() {
 			By("Getting all schedulable nodes")
 			nodes := libnode.GetAllSchedulableNodes(virtClient)
@@ -133,13 +133,17 @@ var _ = Describe("[sig-monitoring]Monitoring", Serial, decorators.SigMonitoring,
 		})
 	})
 
-	Context("Deprecation Alerts", decorators.SigMonitoring, func() {
+	Context("Deprecation Alerts", func() {
 		It("KubeVirtDeprecatedAPIRequested should be triggered when a deprecated API is requested", func() {
-			By("Creating a VMI with deprecated API version")
-			vmi := libvmifact.NewCirros()
-			vmi.APIVersion = "v1alpha3"
-			vmi.Namespace = testsuite.GetTestNamespace(vmi)
-			vmi, err := virtClient.VirtualMachineInstance(vmi.Namespace).Create(context.Background(), vmi, metav1.CreateOptions{})
+			By("Creating a VMI")
+			vmi, err := virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(nil)).
+				Create(context.Background(), libvmifact.NewCirros(), metav1.CreateOptions{})
+			Expect(err).ToNot(HaveOccurred())
+
+			By("Requesting the VMI using the deprecated API version")
+			_, err = virtClient.RestClient().Get().
+				RequestURI(fmt.Sprintf("/apis/kubevirt.io/v1alpha3/namespaces/%s/virtualmachineinstances/%s", vmi.Namespace, vmi.Name)).
+				DoRaw(context.Background())
 			Expect(err).ToNot(HaveOccurred())
 
 			By("Verifying the alert exists")
@@ -149,7 +153,6 @@ var _ = Describe("[sig-monitoring]Monitoring", Serial, decorators.SigMonitoring,
 			libmonitoring.WaitUntilAlertDoesNotExistWithCustomTime(virtClient, 15*time.Minute, "KubeVirtDeprecatedAPIRequested")
 		})
 	})
-
 })
 
 func checkRequiredAnnotations(rule promv1.Rule) {

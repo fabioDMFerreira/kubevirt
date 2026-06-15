@@ -141,7 +141,11 @@
               "pageSize": "pageSizeValue"
             },
             "guest": "0",
-            "maxGuest": "0"
+            "maxGuest": "0",
+            "reservedOverhead": {
+              "addedOverhead": "0",
+              "memLock": "memLockValue"
+            }
           },
           "machine": {
             "type": "typeValue"
@@ -337,6 +341,7 @@
                 "sriov": {},
                 "macvtap": {},
                 "passt": {},
+                "passtBinding": {},
                 "binding": {
                   "name": "nameValue"
                 },
@@ -458,7 +463,8 @@
             },
             "snp": {},
             "tdx": {}
-          }
+          },
+          "rebootPolicy": "rebootPolicyValue"
         },
         "nodeSelector": {
           "nodeSelectorKey": "nodeSelectorValue"
@@ -835,6 +841,10 @@
               "claimName": "claimNameValue",
               "readOnly": true,
               "hotpluggable": true
+            },
+            "containerPath": {
+              "path": "pathValue",
+              "readOnly": true
             }
           }
         ],
@@ -1060,7 +1070,8 @@
               "url": "urlValue",
               "diskId": "diskIdValue",
               "secretRef": "secretRefValue",
-              "certConfigMap": "certConfigMapValue"
+              "certConfigMap": "certConfigMapValue",
+              "insecureSkipVerify": true
             },
             "vddk": {
               "url": "urlValue",
@@ -1339,8 +1350,17 @@
         "startTimestamp": "1986-01-01T01:01:01Z",
         "endTimestamp": "1988-01-01T01:01:01Z",
         "completed": true,
+        "failed": true,
         "backupMsg": "backupMsgValue",
-        "checkpointName": "checkpointNameValue"
+        "checkpointName": "checkpointNameValue",
+        "volumes": [
+          {
+            "volumeName": "volumeNameValue",
+            "diskTarget": "diskTargetValue",
+            "dataEndpoint": "dataEndpointValue",
+            "mapEndpoint": "mapEndpointValue"
+          }
+        ]
       }
     },
     "instancetypeRef": {

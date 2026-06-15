@@ -26,6 +26,8 @@ import (
 	v1 "kubevirt.io/api/core/v1"
 
 	"kubevirt.io/kubevirt/pkg/pointer"
+
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 var _ = Describe("GPU VMI Predicates", func() {
@@ -99,3 +101,181 @@ var _ = Describe("Host Device VMI Predicates", func() {
 		Expect(IsHostDevVMI(vmi)).To(BeTrue())
 	})
 })
+
+var _ = Describe("CountVFIODevices", func() {
+	DescribeTable("should count VFIO devices correctly",
+		func(devices v1.Devices, expected int) {
+			vmi := &v1.VirtualMachineInstance{
+				Spec: v1.VirtualMachineInstanceSpec{
+					Domain: v1.DomainSpec{
+						Devices: devices,
+					},
+				},
+			}
+			Expect(CountVFIODevices(vmi)).To(Equal(expected))
+		},
+		Entry("no devices", v1.Devices{}, 0),
+		Entry("single GPU", v1.Devices{
+			GPUs: []v1.GPU{{Name: "gpu1"}},
+		}, 1),
+		Entry("multiple GPUs", v1.Devices{
+			GPUs: []v1.GPU{{Name: "gpu1"}, {Name: "gpu2"}},
+		}, 2),
+		Entry("single HostDevice", v1.Devices{
+			HostDevices: []v1.HostDevice{{Name: "dev1"}},
+		}, 1),
+		Entry("multiple HostDevices", v1.Devices{
+			HostDevices: []v1.HostDevice{{Name: "dev1"}, {Name: "dev2"}},
+		}, 2),
+		Entry("single SRIOV", v1.Devices{
+			Interfaces: []v1.Interface{
+				{Name: "sriov1", InterfaceBindingMethod: v1.InterfaceBindingMethod{SRIOV: &v1.InterfaceSRIOV{}}},
+			},
+		}, 1),
+		Entry("non-SRIOV interfaces are not counted", v1.Devices{
+			Interfaces: []v1.Interface{
+				{Name: "default", InterfaceBindingMethod: v1.InterfaceBindingMethod{Masquerade: &v1.InterfaceMasquerade{}}},
+			},
+		}, 0),
+		Entry("mixed devices", v1.Devices{
+			GPUs:        []v1.GPU{{Name: "gpu1"}, {Name: "gpu2"}},
+			HostDevices: []v1.HostDevice{{Name: "dev1"}},
+			Interfaces: []v1.Interface{
+				{Name: "sriov1", InterfaceBindingMethod: v1.InterfaceBindingMethod{SRIOV: &v1.InterfaceSRIOV{}}},
+				{Name: "default", InterfaceBindingMethod: v1.InterfaceBindingMethod{Masquerade: &v1.InterfaceMasquerade{}}},
+			},
+		}, 4),
+	)
+})
+
+var _ = DescribeTable("memory overhead reservation requirements",
+	func(vmi *v1.VirtualMachineInstance, expected bool) {
+		res := RequiresMemoryOverheadReservation(vmi)
+		Expect(res).To(Equal(expected))
+	},
+	Entry(
+		"Domain Memory reference is nil",
+		&v1.VirtualMachineInstance{},
+		false,
+	),
+	Entry(
+		"ReservedOverhead reference is nil",
+		&v1.VirtualMachineInstance{
+			Spec: v1.VirtualMachineInstanceSpec{
+				Domain: v1.DomainSpec{
+					Memory: &v1.Memory{},
+				},
+			},
+		},
+		false,
+	),
+	Entry(
+		"ReservedOverhead reference is empty",
+		&v1.VirtualMachineInstance{
+			Spec: v1.VirtualMachineInstanceSpec{
+				Domain: v1.DomainSpec{
+					Memory: &v1.Memory{
+						ReservedOverhead: &v1.ReservedOverhead{},
+					},
+				},
+			},
+		},
+		false,
+	),
+	Entry(
+		"AddedOverhead has a value",
+		&v1.VirtualMachineInstance{
+			Spec: v1.VirtualMachineInstanceSpec{
+				Domain: v1.DomainSpec{
+					Memory: &v1.Memory{
+						ReservedOverhead: &v1.ReservedOverhead{
+							AddedOverhead: pointer.P(resource.MustParse("1Gi")),
+						},
+					},
+				},
+			},
+		},
+		true,
+	),
+)
+
+var _ = DescribeTable("memory lock limit requirements",
+	func(vmi *v1.VirtualMachineInstance, expected bool) {
+		res := RequiresLockingMemory(vmi)
+		Expect(res).To(Equal(expected))
+	},
+	Entry(
+		"Domain Memory reference is nil",
+		&v1.VirtualMachineInstance{},
+		false,
+	),
+	Entry(
+		"ReservedOverhead reference is nil",
+		&v1.VirtualMachineInstance{
+			Spec: v1.VirtualMachineInstanceSpec{
+				Domain: v1.DomainSpec{
+					Memory: &v1.Memory{},
+				},
+			},
+		},
+		false,
+	),
+	Entry(
+		"ReservedOverhead reference is empty",
+		&v1.VirtualMachineInstance{
+			Spec: v1.VirtualMachineInstanceSpec{
+				Domain: v1.DomainSpec{
+					Memory: &v1.Memory{
+						ReservedOverhead: &v1.ReservedOverhead{},
+					},
+				},
+			},
+		},
+		false,
+	),
+	Entry(
+		"MemLock is whatever other than Required",
+		&v1.VirtualMachineInstance{
+			Spec: v1.VirtualMachineInstanceSpec{
+				Domain: v1.DomainSpec{
+					Memory: &v1.Memory{
+						ReservedOverhead: &v1.ReservedOverhead{
+							MemLock: pointer.P(v1.MemLockRequirement("notExpectedValue")),
+						},
+					},
+				},
+			},
+		},
+		false,
+	),
+	Entry(
+		"MemLock is NotRequired",
+		&v1.VirtualMachineInstance{
+			Spec: v1.VirtualMachineInstanceSpec{
+				Domain: v1.DomainSpec{
+					Memory: &v1.Memory{
+						ReservedOverhead: &v1.ReservedOverhead{
+							MemLock: pointer.P(v1.MemLockRequirement(v1.MemLockNotRequired)),
+						},
+					},
+				},
+			},
+		},
+		false,
+	),
+	Entry(
+		"MemLock is Required",
+		&v1.VirtualMachineInstance{
+			Spec: v1.VirtualMachineInstanceSpec{
+				Domain: v1.DomainSpec{
+					Memory: &v1.Memory{
+						ReservedOverhead: &v1.ReservedOverhead{
+							MemLock: pointer.P(v1.MemLockRequirement(v1.MemLockRequired)),
+						},
+					},
+				},
+			},
+		},
+		true,
+	),
+)

@@ -644,6 +644,17 @@ func (app *virtAPIApp) composeSubresources() {
 			Returns(http.StatusNotFound, httpStatusNotFoundMessage, "").
 			Returns(http.StatusBadRequest, httpStatusBadRequestMessage, ""))
 
+		subws.Route(subws.PUT(definitions.NamespacedResourcePath(subresourcesvmiGVR)+definitions.SubResourcePath("redefine-checkpoint")).
+			To(subresourceApp.RedefineCheckpointVMIRequestHandler).
+			Consumes(mime.MIME_ANY).
+			Reads(backupv1.BackupCheckpoint{}).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Operation(version.Version+"RedefineCheckpoint").
+			Doc("Redefine a checkpoint for a VirtualMachineInstance.").
+			Returns(http.StatusOK, "OK", "").
+			Returns(http.StatusNotFound, httpStatusNotFoundMessage, "").
+			Returns(http.StatusBadRequest, httpStatusBadRequestMessage, ""))
+
 		// Return empty api resource list.
 		// K8s expects to be able to retrieve a resource list for each aggregated
 		// app in order to discover what resources it provides. Without returning
@@ -680,6 +691,10 @@ func (app *virtAPIApp) composeSubresources() {
 					},
 					{
 						Name:       "virtualmachineinstances/backup",
+						Namespaced: true,
+					},
+					{
+						Name:       "virtualmachineinstances/redefine-checkpoint",
 						Namespaced: true,
 					},
 					{
@@ -1049,6 +1064,9 @@ func (app *virtAPIApp) registerMutatingWebhook(informers *webhooks.Informers) {
 	http.HandleFunc(components.VMCloneCreateMutatePath, func(w http.ResponseWriter, r *http.Request) {
 		mutating_webhook.ServeClones(w, r)
 	})
+	http.HandleFunc(components.VirtLauncherPodMutatePath, func(w http.ResponseWriter, r *http.Request) {
+		mutating_webhook.ServeVirtLauncherPods(w, r, app.clusterConfig, app.virtCli)
+	})
 }
 
 func (app *virtAPIApp) setupTLS(k8sCAManager kvtls.KubernetesCAManager, kubevirtCAManager kvtls.ClientCAManager) {
@@ -1107,6 +1125,8 @@ func (app *virtAPIApp) startTLS(informerFactory controller.KubeInformerFactory) 
 		errors <- server.ListenAndServeTLS("", "")
 	}()
 
+	metrics.SetVirtAPIReady()
+
 	// start graceful shutdown handler
 	go func() {
 		select {
@@ -1115,6 +1135,8 @@ func (app *virtAPIApp) startTLS(informerFactory controller.KubeInformerFactory) 
 		case msg := <-app.reInitChan:
 			log.Log.Infof("Received signal to reInitialize virt-api [%s], initiating graceful shutdown", msg)
 		}
+
+		metrics.SetVirtAPINotReady()
 
 		// pause briefly to ensure the load balancer has had a chance to
 		// remove this endpoint from rotation due to pod.DeletionTimestamp != nil

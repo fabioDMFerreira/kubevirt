@@ -29,6 +29,45 @@ import (
 func virtHandlerAlerts(namespace string) []promv1.Rule {
 	return []promv1.Rule{
 		{
+			Alert: "VirtHandlerDown",
+			Expr:  intstr.FromString("cluster:kubevirt_virt_handler_pods_running:count == 0"),
+			For:   ptr.To(promv1.Duration("10m")),
+			Annotations: map[string]string{
+				summaryAnnotationKey: "No running virt-handler pods were detected for the last 10 min.",
+			},
+			Labels: map[string]string{
+				severityAlertLabelKey:        "critical",
+				operatorHealthImpactLabelKey: "critical",
+			},
+		},
+		{
+			Alert: "LowReadyVirtHandlerCount",
+			Expr: intstr.FromString(
+				"cluster:kubevirt_virt_handler_ready:sum < cluster:kubevirt_virt_handler_pods_running:count " +
+					"and cluster:kubevirt_virt_handler_ready:sum > 0",
+			),
+			For: ptr.To(promv1.Duration("10m")),
+			Annotations: map[string]string{
+				summaryAnnotationKey: "Some virt-handlers are running but not ready.",
+			},
+			Labels: map[string]string{
+				severityAlertLabelKey:        "warning",
+				operatorHealthImpactLabelKey: "warning",
+			},
+		},
+		{
+			Alert: "NoReadyVirtHandler",
+			Expr:  intstr.FromString("cluster:kubevirt_virt_handler_ready:sum == 0"),
+			For:   ptr.To(promv1.Duration("10m")),
+			Annotations: map[string]string{
+				summaryAnnotationKey: "No ready virt-handler was detected for the last 10 min.",
+			},
+			Labels: map[string]string{
+				severityAlertLabelKey:        "critical",
+				operatorHealthImpactLabelKey: "critical",
+			},
+		},
+		{
 			Alert: "VirtHandlerDaemonSetRolloutFailing",
 			Expr: intstr.FromString(
 				fmt.Sprintf("(%s - %s) != 0",
@@ -36,7 +75,7 @@ func virtHandlerAlerts(namespace string) []promv1.Rule {
 					fmt.Sprintf("kube_daemonset_status_desired_number_scheduled{namespace='%s', daemonset='virt-handler'}", namespace))),
 			For: ptr.To(promv1.Duration("15m")),
 			Annotations: map[string]string{
-				"summary": "Some virt-handlers failed to roll out",
+				summaryAnnotationKey: "Some virt-handlers failed to roll out",
 			},
 			Labels: map[string]string{
 				severityAlertLabelKey:        "warning",
@@ -45,10 +84,10 @@ func virtHandlerAlerts(namespace string) []promv1.Rule {
 		},
 		{
 			Alert: "VirtHandlerRESTErrorsBurst",
-			Expr:  intstr.FromString(getErrorRatio(namespace, "virt-handler", "(4|5)[0-9][0-9]", 5) + " >= 0.8"),
+			Expr:  intstr.FromString(getErrorRatio(namespace, "virt-handler", "(4|5)[0-9][0-9]", fiveMinutes) + " >= 0.8"),
 			For:   ptr.To(promv1.Duration("5m")),
 			Annotations: map[string]string{
-				"summary": getRestCallsFailedWarning(80, "virt-handler", durationFiveMinutes),
+				summaryAnnotationKey: getRestCallsFailedWarning(eightyPercent, "virt-handler", fiveMinutes),
 			},
 			Labels: map[string]string{
 				severityAlertLabelKey:        "critical",

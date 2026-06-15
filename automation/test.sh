@@ -21,7 +21,7 @@ set -ex
 
 export TIMESTAMP=${TIMESTAMP:-1}
 
-export KUBEVIRT_DEPLOY_NP="${KUBEVIRT_DEPLOY_NP:-false}"
+export KUBEVIRT_DEPLOY_NP="${KUBEVIRT_DEPLOY_NP:-true}"
 export WORKSPACE="${WORKSPACE:-$PWD}"
 export IMAGE_PULL_POLICY="${IMAGE_PULL_POLICY:-IfNotPresent}"
 readonly ARTIFACTS_PATH="${ARTIFACTS-$WORKSPACE/exported-artifacts}"
@@ -47,11 +47,19 @@ if [ -z $TARGET ]; then
   exit 1
 fi
 
+add_feature_gate() {
+  if [ -z "$FEATURE_GATES" ]; then
+    export FEATURE_GATES="$1"
+  else
+    export FEATURE_GATES="$FEATURE_GATES,$1"
+  fi
+}
+
 export KUBEVIRT_DEPLOY_CDI=true
+export KUBEVIRT_CUSTOM_CDI_VERSION=v1.65.0
 if [[ ! $TARGET =~ .*kind.* ]]; then
-  export FEATURE_GATES="NodeRestriction"
+  add_feature_gate "NodeRestriction"
   export KUBEVIRT_PSA="true"
-  export KUBEVIRT_FLANNEL=true
 fi
 
 case "$TARGET" in
@@ -65,6 +73,7 @@ case "$TARGET" in
     export KUBEVIRT_DEPLOY_NET_BINDING_CNI=true
     export KUBEVIRT_DEPLOY_CDI=false
     export KUBEVIRT_DEPLOY_ISTIO=true
+    export KUBEVIRT_DEPLOY_NETWORK_RESOURCES_INJECTOR=true
     export KUBEVIRT_PROVIDER=${TARGET/-sig-network*/}
     ;;
   *sig-storage*)
@@ -128,6 +137,12 @@ case "$TARGET" in
     export KUBEVIRT_PROVIDER=${TARGET/-wg-arm64}
     export KUBEVIRT_COLLECT_CONTAINER_RUNTIME_DEBUG=true
     ;;
+  *wg-mshv-amd64*)
+    export KUBEVIRT_PROVIDER=${TARGET/-wg-mshv-amd64/}
+    export KUBEVIRT_COLLECT_CONTAINER_RUNTIME_DEBUG=true
+    add_feature_gate "ConfigurableHypervisor"
+    export HYPERVISOR="hyperv-direct"
+    ;;
   *sev*)
     export KUBEVIRT_PROVIDER=${TARGET/-sev}
     ;;
@@ -155,6 +170,7 @@ if [[ $TARGET =~ sriov.* ]]; then
   fi
   export KUBEVIRT_DEPLOY_CDI="false"
   export KUBEVIRT_VERBOSITY=${KUBEVIRT_VERBOSITY:-"virtLauncher:3,virtHandler:3"}
+  add_feature_gate "ExternalNetResourceInjection"
 elif [[ $TARGET =~ vgpu.* ]]; then
   export KUBEVIRT_NUM_NODES=1
 else

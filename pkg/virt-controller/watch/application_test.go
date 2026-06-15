@@ -153,8 +153,10 @@ var _ = Describe("Application", func() {
 			storageProfileInformer,
 			cdiInformer,
 			cdiConfigInformer,
+			kvInformer,
 			config,
 			topology.NewTopologyHinter(&cache.FakeCustomStore{}, &cache.FakeCustomStore{}, nil),
+			nil,
 			nil,
 			func(_ *v1.VirtualMachineInstance, _ *k8sv1.Pod) error { return nil },
 			func(_ *k8sfield.Path, _ *v1.VirtualMachineInstanceSpec, _ *virtconfig.ClusterConfig) []metav1.StatusCause {
@@ -250,6 +252,7 @@ var _ = Describe("Application", func() {
 			PreferenceInformer:          preferenceInformer,
 			ClusterPreferenceInformer:   clusterPreferenceInformer,
 			ControllerRevisionInformer:  controllerRevisionInformer,
+			VMBackupInformer:            backupInformer,
 		}
 		_ = app.exportController.Init()
 		app.persistentVolumeClaimInformer = pvcInformer
@@ -273,7 +276,10 @@ var _ = Describe("Application", func() {
 			vmInformer,
 			vmiInformer,
 			pvcInformer,
+			vmExportInformer,
+			configMapInformer,
 			recorder,
+			"",
 		)
 
 		app.readyChan = make(chan bool)
@@ -383,7 +389,7 @@ var _ = Describe("Application", func() {
 
 type stubMigrationEvaluator struct{}
 
-func (e stubMigrationEvaluator) Evaluate(_ *v1.VirtualMachineInstance) k8sv1.ConditionStatus {
+func (e stubMigrationEvaluator) Evaluate(_ *v1.VirtualMachineInstance, _ *k8sv1.Pod) k8sv1.ConditionStatus {
 	return k8sv1.ConditionUnknown
 }
 

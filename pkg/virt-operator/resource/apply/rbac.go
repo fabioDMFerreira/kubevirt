@@ -16,6 +16,7 @@ import (
 
 	"kubevirt.io/client-go/log"
 
+	"kubevirt.io/kubevirt/pkg/virt-operator/resource/generate/components"
 	"kubevirt.io/kubevirt/pkg/virt-operator/resource/generate/rbac"
 )
 
@@ -55,7 +56,8 @@ func rbacCreateOrUpdate(r *Reconciler, required runtime.Object, imageTag, imageR
 		// Create non existent
 		err = getRbacCreateFunction(r, required)()
 		if err != nil {
-			return fmt.Errorf("unable to create %v %+v: %v", roleTypeName, required, err)
+			log.Log.V(2).Infof("failed to create %v %s: %+v", roleTypeName, requiredMeta.GetName(), required)
+			return fmt.Errorf("unable to create %v %s: %v", roleTypeName, requiredMeta.GetName(), err)
 		}
 		log.Log.V(2).Infof("%v %v created", roleTypeName, requiredMeta.GetName())
 		return nil
@@ -78,7 +80,8 @@ func rbacCreateOrUpdate(r *Reconciler, required runtime.Object, imageTag, imageR
 	// Update existing, we don't need to patch for rbac rules.
 	err = getRbacUpdateFunction(r, existingCopy)()
 	if err != nil {
-		return fmt.Errorf("unable to update %v %+v: %v", roleTypeName, required, err)
+		log.Log.V(2).Infof("failed to update %v %s: %+v", roleTypeName, requiredMeta.GetName(), existingCopy)
+		return fmt.Errorf("unable to update %v %s: %v", roleTypeName, requiredMeta.GetName(), err)
 	}
 	log.Log.V(2).Infof("%v %v updated", roleTypeName, requiredMeta.GetName())
 
@@ -120,10 +123,11 @@ func getRbacCreateFunction(r *Reconciler, obj runtime.Object) (createFunc func()
 		}
 	case *rbacv1.RoleBinding:
 		roleBinding := obj.(*rbacv1.RoleBinding)
+		components.UpdateTemplateAuthReaderNamespace(roleBinding, namespace)
 
 		createFunc = func() error {
 			raiseExpectation(r.expectations.RoleBinding)
-			_, err := rbacObj.RoleBindings(namespace).Create(context.Background(), roleBinding, metav1.CreateOptions{})
+			_, err := rbacObj.RoleBindings(roleBinding.Namespace).Create(context.Background(), roleBinding, metav1.CreateOptions{})
 			lowerExpectationIfErr(r.expectations.RoleBinding, err)
 			return err
 		}
@@ -162,9 +166,10 @@ func getRbacUpdateFunction(r *Reconciler, obj runtime.Object) (updateFunc func()
 		}
 	case *rbacv1.RoleBinding:
 		roleBinding := obj.(*rbacv1.RoleBinding)
+		components.UpdateTemplateAuthReaderNamespace(roleBinding, namespace)
 
 		updateFunc = func() (err error) {
-			_, err = rbacObj.RoleBindings(namespace).Update(context.Background(), roleBinding, metav1.UpdateOptions{})
+			_, err = rbacObj.RoleBindings(roleBinding.Namespace).Update(context.Background(), roleBinding, metav1.UpdateOptions{})
 			return err
 		}
 	case *rbacv1.ClusterRoleBinding:

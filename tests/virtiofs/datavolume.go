@@ -65,7 +65,7 @@ const (
 	checkingVMInstanceConsoleOut = "Checking that the VirtualMachineInstance console has expected output"
 )
 
-var _ = Describe("[sig-storage] virtiofs", decorators.SigStorage, func() {
+var _ = Describe("[sig-storage] virtiofs", decorators.SigStorage, decorators.VirtioFS, func() {
 	var err error
 	var virtClient kubecli.KubevirtClient
 	var vmi *virtv1.VirtualMachineInstance
@@ -333,7 +333,7 @@ var _ = Describe("[sig-storage] virtiofs", decorators.SigStorage, func() {
 			Expect(strings.Trim(podVirtioFsFileExist, "\n")).To(Equal("exist"))
 			err = virtClient.VirtualMachineInstance(vmi.Namespace).Delete(context.Background(), vmi.Name, metav1.DeleteOptions{})
 			Expect(err).ToNot(HaveOccurred())
-			libwait.WaitForVirtualMachineToDisappearWithTimeout(vmi, 120)
+			Expect(libwait.WaitForVirtualMachineToDisappearWithTimeout(vmi, 120*time.Second)).To(Succeed())
 		})
 	})
 })

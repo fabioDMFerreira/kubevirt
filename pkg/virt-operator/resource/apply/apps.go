@@ -13,12 +13,14 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	v1 "kubevirt.io/api/core/v1"
 	"kubevirt.io/client-go/kubecli"
 	"kubevirt.io/client-go/log"
 
+	v1 "kubevirt.io/api/core/v1"
+
 	"kubevirt.io/kubevirt/pkg/apimachinery/patch"
 	"kubevirt.io/kubevirt/pkg/pointer"
+	kvtls "kubevirt.io/kubevirt/pkg/util/tls"
 	"kubevirt.io/kubevirt/pkg/virt-operator/resource/generate/components"
 	"kubevirt.io/kubevirt/pkg/virt-operator/resource/placement"
 	"kubevirt.io/kubevirt/pkg/virt-operator/util"
@@ -33,14 +35,19 @@ var (
 	daemonSetFastMaxUnavailable    = intstr.FromString("10%")
 )
 
-type CanaryUpgradeStatus string
+// canaryUpgradeStatus represents the current phase of a DaemonSet canary
+// upgrade within processCanaryUpgrade. The phases progress as:
+// started -> canary -> increasing -> waiting -> successful
+// Any phase can transition to failed on error.
+type canaryUpgradeStatus string
 
 const (
-	CanaryUpgradeStatusStarted                 CanaryUpgradeStatus = "started"
-	CanaryUpgradeStatusUpgradingDaemonSet      CanaryUpgradeStatus = "upgrading daemonset"
-	CanaryUpgradeStatusWaitingDaemonSetRollout CanaryUpgradeStatus = "waiting for daemonset rollout"
-	CanaryUpgradeStatusSuccessful              CanaryUpgradeStatus = "successful"
-	CanaryUpgradeStatusFailed                  CanaryUpgradeStatus = "failed"
+	started    canaryUpgradeStatus = "started"    // spec patched with MaxUnavailable=1, initial canary pod rolling out
+	canary     canaryUpgradeStatus = "canary"     // waiting for the single canary pod to become ready
+	increasing canaryUpgradeStatus = "increasing" // canary healthy, MaxUnavailable raised to 10% for full rollout
+	waiting    canaryUpgradeStatus = "waiting"    // full rollout in progress, waiting for all pods to become ready
+	successful canaryUpgradeStatus = "successful" // all pods ready, MaxUnavailable reverted to default
+	failed     canaryUpgradeStatus = "failed"
 )
 
 func (r *Reconciler) syncDeployment(origDeployment *appsv1.Deployment) (*appsv1.Deployment, error) {
@@ -57,7 +64,9 @@ func (r *Reconciler) syncDeployment(origDeployment *appsv1.Deployment) (*appsv1.
 
 	if kv.Spec.Infra != nil && kv.Spec.Infra.Replicas != nil {
 		replicas := int32(*kv.Spec.Infra.Replicas)
-		if deployment.Spec.Replicas == nil || *deployment.Spec.Replicas != replicas {
+		if (deployment.Spec.Replicas == nil || *deployment.Spec.Replicas != replicas) &&
+			deployment.Name != components.VirtTemplateApiserverDeploymentName &&
+			deployment.Name != components.VirtTemplateControllerDeploymentName {
 			deployment.Spec.Replicas = &replicas
 			r.recorder.Eventf(deployment, corev1.EventTypeWarning, "AdvancedFeatureUse", "applying custom number of infra replica. this is an advanced feature that prevents "+
 				"auto-scaling for core kubevirt components. Please use with caution!")
@@ -71,13 +80,26 @@ func (r *Reconciler) syncDeployment(origDeployment *appsv1.Deployment) (*appsv1.
 		}
 	}
 
+	switch deployment.Name {
+	case components.VirtTemplateApiserverDeploymentName:
+		if err := kvtls.InjectTLSConfigIntoDeployment(kv, deployment, components.VirtTemplateApiserverContainerName); err != nil {
+			return nil, err
+		}
+	case components.VirtTemplateControllerDeploymentName:
+		if err := kvtls.InjectTLSConfigIntoDeployment(kv, deployment, components.VirtTemplateControllerContainerName); err != nil {
+			return nil, err
+		}
+	}
+
 	obj, exists, _ := r.stores.DeploymentCache.Get(deployment)
 	if !exists {
 		r.expectations.Deployment.RaiseExpectations(r.kvKey, 1, 0)
+		origDeployment := deployment
 		deployment, err := apps.Deployments(kv.Namespace).Create(context.Background(), deployment, metav1.CreateOptions{})
 		if err != nil {
 			r.expectations.Deployment.LowerExpectations(r.kvKey, 1, 0)
-			return nil, fmt.Errorf("unable to create deployment %+v: %v", deployment, err)
+			log.Log.V(2).Infof("failed to create deployment %s: %+v", origDeployment.Name, origDeployment)
+			return nil, fmt.Errorf("unable to create deployment %s: %v", origDeployment.Name, err)
 		}
 
 		SetGeneration(&kv.Status.Generations, deployment)
@@ -109,15 +131,18 @@ func (r *Reconciler) syncDeployment(origDeployment *appsv1.Deployment) (*appsv1.
 	}
 
 	ops, err := patch.New(getPatchWithObjectMetaAndSpec([]patch.PatchOption{
-		patch.WithTest("/metadata/generation", cachedDeployment.ObjectMeta.Generation)},
+		patch.WithTest("/metadata/generation", cachedDeployment.ObjectMeta.Generation),
+	},
 		&deployment.ObjectMeta, deployment.Spec)...).GeneratePayload()
 	if err != nil {
 		return nil, err
 	}
 
+	prePatchDeployment := deployment
 	deployment, err = apps.Deployments(kv.Namespace).Patch(context.Background(), deployment.Name, types.JSONPatchType, ops, metav1.PatchOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("unable to update deployment %+v: %v", deployment, err)
+		log.Log.V(2).Infof("failed to update deployment %s: %+v", prePatchDeployment.Name, prePatchDeployment)
+		return nil, fmt.Errorf("unable to update deployment %s: %v", prePatchDeployment.Name, err)
 	}
 
 	SetGeneration(&kv.Status.Generations, deployment)
@@ -135,7 +160,8 @@ func setMaxUnavailable(daemonSet *appsv1.DaemonSet, maxUnavailable intstr.IntOrS
 func generateDaemonSetPatch(oldDs, newDs *appsv1.DaemonSet) ([]byte, error) {
 	return patch.New(
 		getPatchWithObjectMetaAndSpec([]patch.PatchOption{
-			patch.WithTest("/metadata/generation", oldDs.ObjectMeta.Generation)},
+			patch.WithTest("/metadata/generation", oldDs.ObjectMeta.Generation),
+		},
 			&newDs.ObjectMeta, newDs.Spec)...).GeneratePayload()
 }
 
@@ -152,7 +178,8 @@ func (r *Reconciler) patchDaemonSet(oldDs, newDs *appsv1.DaemonSet) (*appsv1.Dae
 		patch,
 		metav1.PatchOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("unable to update daemonset %+v: %v", oldDs, err)
+		log.Log.V(2).Infof("failed to update daemonset %s: %+v", oldDs.Name, oldDs)
+		return nil, fmt.Errorf("unable to update daemonset %s: %v", oldDs.Name, err)
 	}
 	return newDs, nil
 }
@@ -189,10 +216,8 @@ func daemonHasDefaultRolloutStrategy(daemonSet *appsv1.DaemonSet) bool {
 	return getMaxUnavailable(daemonSet) == daemonSetDefaultMaxUnavailable.IntValue()
 }
 
-func (r *Reconciler) processCanaryUpgrade(cachedDaemonSet, newDS *appsv1.DaemonSet, forceUpdate bool) (bool, error, CanaryUpgradeStatus) {
+func (r *Reconciler) processCanaryUpgrade(cachedDaemonSet, newDS *appsv1.DaemonSet, objectChanged bool) (bool, error, canaryUpgradeStatus) {
 	var updatedAndReadyPods int32
-	var status CanaryUpgradeStatus
-	done := false
 
 	if hasTLS(cachedDaemonSet) && !hasTLS(newDS) {
 		insertTLS(newDS)
@@ -203,89 +228,85 @@ func (r *Reconciler) processCanaryUpgrade(cachedDaemonSet, newDS *appsv1.DaemonS
 	}
 	log := log.Log.With("resource", fmt.Sprintf("ds/%s", cachedDaemonSet.Name))
 
-	isDaemonSetUpdated := util.DaemonSetIsUpToDate(r.kv, cachedDaemonSet) && !forceUpdate
 	desiredReadyPods := cachedDaemonSet.Status.DesiredNumberScheduled
-	if isDaemonSetUpdated {
-		updatedAndReadyPods = r.howManyUpdatedAndReadyPods(cachedDaemonSet)
-	}
+	updatedAndReadyPods = r.howManyUpdatedAndReadyPods(cachedDaemonSet)
 
 	switch {
+	case objectChanged:
+		// start canary upgrade
+		setMaxUnavailable(newDS, daemonSetDefaultMaxUnavailable)
+		newDS, err := r.patchDaemonSet(cachedDaemonSet, newDS)
+		if err != nil {
+			return false, fmt.Errorf("unable to start canary upgrade for daemonset %+v: %v", newDS, err), failed
+		}
+		log.V(2).Infof("daemonSet %v started upgrade", newDS.GetName())
+		// Do not call SetGeneration here. The generation mismatch ensures
+		// subsequent reconciles re-enter processCanaryUpgrade so the
+		// canary can progress through Increasing and Successful.
+		return false, nil, started
 	case updatedAndReadyPods == 0:
-		if !isDaemonSetUpdated {
-			// start canary upgrade
-			setMaxUnavailable(newDS, daemonSetDefaultMaxUnavailable)
-			_, err := r.patchDaemonSet(cachedDaemonSet, newDS)
-			if err != nil {
-				return false, fmt.Errorf("unable to start canary upgrade for daemonset %+v: %v", newDS, err), CanaryUpgradeStatusFailed
-			}
-			log.V(2).Infof("daemonSet %v started upgrade", newDS.GetName())
-		} else {
-			// check for a crashed canary pod
-			canaryPods := r.getCanaryPods(cachedDaemonSet)
-			for _, canary := range canaryPods {
-				if canary != nil && util.PodIsCrashLooping(canary) {
-					r.recorder.Eventf(cachedDaemonSet, corev1.EventTypeWarning, failedUpdateDaemonSetReason, "daemonSet %v rollout failed", cachedDaemonSet.Name)
-					return false, fmt.Errorf("daemonSet %s rollout failed", cachedDaemonSet.Name), CanaryUpgradeStatusFailed
-				}
+		// check for a crashed canary pod
+		canaryPods := r.getCanaryPods(cachedDaemonSet)
+		for _, canary := range canaryPods {
+			if canary != nil && util.PodIsCrashLooping(canary) {
+				r.recorder.Eventf(cachedDaemonSet, corev1.EventTypeWarning, failedUpdateDaemonSetReason, "daemonSet %v rollout failed", cachedDaemonSet.Name)
+				return false, fmt.Errorf("daemonSet %s rollout failed", cachedDaemonSet.Name), failed
 			}
 		}
-		done, status = false, CanaryUpgradeStatusStarted
+		return false, nil, canary
 	case updatedAndReadyPods > 0 && updatedAndReadyPods < desiredReadyPods:
 		if daemonHasDefaultRolloutStrategy(cachedDaemonSet) {
 			// canary was ok, start real rollout
 			setMaxUnavailable(newDS, daemonSetFastMaxUnavailable)
 			// start rollout again
-			_, err := r.patchDaemonSet(cachedDaemonSet, newDS)
-			if err != nil {
-				return false, fmt.Errorf("unable to update daemonset %+v: %v", newDS, err), CanaryUpgradeStatusFailed
-			}
-			log.V(2).Infof("daemonSet %v updated", newDS.GetName())
-			status = CanaryUpgradeStatusUpgradingDaemonSet
-		} else {
-			log.V(4).Infof("waiting for all pods of daemonSet %v to be ready", newDS.GetName())
-			status = CanaryUpgradeStatusWaitingDaemonSetRollout
-		}
-		done = false
-	case updatedAndReadyPods > 0 && updatedAndReadyPods == desiredReadyPods:
-
-		// rollout has completed and all virt-handlers are ready
-		if !daemonHasDefaultRolloutStrategy(cachedDaemonSet) {
-			// revert maxUnavailable to default value
-			setMaxUnavailable(newDS, daemonSetDefaultMaxUnavailable)
 			var err error
 			newDS, err = r.patchDaemonSet(cachedDaemonSet, newDS)
 			if err != nil {
-				return false, err, CanaryUpgradeStatusFailed
+				return false, fmt.Errorf("unable to update daemonset %+v: %v", newDS, err), failed
 			}
-			log.V(2).Infof("daemonSet %v updated back to default", newDS.GetName())
+			log.V(2).Infof("daemonSet %v updated", newDS.GetName())
 			SetGeneration(&r.kv.Status.Generations, newDS)
-			return false, nil, CanaryUpgradeStatusWaitingDaemonSetRollout
+			return false, nil, increasing
 		}
-
+		log.V(4).Infof("waiting for all pods of daemonSet %v to be ready", newDS.GetName())
+		return false, nil, waiting
+	case updatedAndReadyPods > 0 && updatedAndReadyPods == desiredReadyPods:
+		var err error
 		if supportsTLS(cachedDaemonSet) {
 			if !hasTLS(cachedDaemonSet) {
 				insertTLS(newDS)
-				_, err := r.patchDaemonSet(cachedDaemonSet, newDS)
-				log.V(2).Infof("daemonSet %v updated to default CN TLS", newDS.GetName())
+				newDS, err = r.patchDaemonSet(cachedDaemonSet, newDS)
+				if err != nil {
+					return false, err, failed
+				}
 				SetGeneration(&r.kv.Status.Generations, newDS)
-				return false, err, CanaryUpgradeStatusWaitingDaemonSetRollout
+				return false, nil, waiting
 			}
 			if hasCertificateSecret(&newDS.Spec.Template.Spec, components.VirtHandlerCertSecretName) {
 				unattachCertificateSecret(&newDS.Spec.Template.Spec, components.VirtHandlerCertSecretName)
-				var err error
-				cachedDaemonSet, err = r.patchDaemonSet(cachedDaemonSet, newDS)
+				newDS, err = r.patchDaemonSet(cachedDaemonSet, newDS)
 				if err != nil {
-					return false, err, CanaryUpgradeStatusFailed
+					return false, err, failed
 				}
-				log.V(2).Infof("daemonSet %v updated to secure certificates", newDS.GetName())
+				SetGeneration(&r.kv.Status.Generations, newDS)
+				return false, nil, waiting
 			}
 		}
-
-		SetGeneration(&r.kv.Status.Generations, cachedDaemonSet)
+		// rollout has completed and all virt-handlers are ready revert
+		// maxUnavailable to default value
+		setMaxUnavailable(newDS, daemonSetDefaultMaxUnavailable)
+		newDS, err = r.patchDaemonSet(cachedDaemonSet, newDS)
+		if err != nil {
+			return false, err, failed
+		}
+		SetGeneration(&r.kv.Status.Generations, newDS)
 		log.V(2).Infof("daemonSet %v is ready", newDS.GetName())
-		done, status = true, CanaryUpgradeStatusSuccessful
+		return true, nil, successful
+	default:
+		err := fmt.Errorf("unexpected canary upgrade state: updatedAndReadyPods=%d, desiredReadyPods=%d", updatedAndReadyPods, desiredReadyPods)
+		log.Errorf("%s", err)
+		return false, err, failed
 	}
-	return done, nil, status
 }
 
 func supportsTLS(daemonSet *appsv1.DaemonSet) bool {
@@ -374,10 +395,12 @@ func (r *Reconciler) syncDaemonSet(daemonSet *appsv1.DaemonSet) (bool, error) {
 			unattachCertificateSecret(&daemonSet.Spec.Template.Spec, components.VirtHandlerCertSecretName)
 		}
 
+		origDaemonSet := daemonSet
 		daemonSet, err := apps.DaemonSets(kv.Namespace).Create(context.Background(), daemonSet, metav1.CreateOptions{})
 		if err != nil {
 			r.expectations.DaemonSet.LowerExpectations(r.kvKey, 1, 0)
-			return false, fmt.Errorf("unable to create daemonset %+v: %v", daemonSet, err)
+			log.Log.V(2).Infof("failed to create daemonset %s: %+v", origDaemonSet.Name, origDaemonSet)
+			return false, fmt.Errorf("unable to create daemonset %s: %v", origDaemonSet.Name, err)
 		}
 
 		SetGeneration(&kv.Status.Generations, daemonSet)
@@ -385,13 +408,16 @@ func (r *Reconciler) syncDaemonSet(daemonSet *appsv1.DaemonSet) (bool, error) {
 	}
 
 	cachedDaemonSet = obj.(*appsv1.DaemonSet)
-	modified := resourcemerge.BoolPtr(false)
 	existingCopy := cachedDaemonSet.DeepCopy()
-	expectedGeneration := GetExpectedGeneration(daemonSet, kv.Status.Generations)
 
-	resourcemerge.EnsureObjectMeta(modified, &existingCopy.ObjectMeta, daemonSet.ObjectMeta)
-	// there was no change to metadata, the generation was right
-	if !*modified && existingCopy.GetGeneration() == expectedGeneration {
+	objectMetaModified := resourcemerge.BoolPtr(false)
+	resourcemerge.EnsureObjectMeta(objectMetaModified, &existingCopy.ObjectMeta, daemonSet.ObjectMeta)
+
+	specChanged := !util.DaemonSetIsUpToDate(r.kv, cachedDaemonSet) || *objectMetaModified
+	generationUnknown := existingCopy.GetGeneration() != GetExpectedGeneration(daemonSet, kv.Status.Generations)
+	ongoingRollout := !daemonHasDefaultRolloutStrategy(cachedDaemonSet)
+
+	if !specChanged && !ongoingRollout && !generationUnknown {
 		log.Log.V(4).Infof("daemonset %v is up-to-date", daemonSet.GetName())
 		return true, nil
 	}
@@ -404,7 +430,12 @@ func (r *Reconciler) syncDaemonSet(daemonSet *appsv1.DaemonSet) (bool, error) {
 	// start the rollout of the new virt-handler again
 	// wait for all nodes to complete the rollout
 	// set maxUnavailable back to 1
-	done, err, _ := r.processCanaryUpgrade(cachedDaemonSet, daemonSet, *modified)
+	//
+	// Only pass specChanged as objectChanged to processCanaryUpgrade so
+	// that an unknown generation alone does not restart the canary from
+	// scratch. The generation will be re-recorded when the canary
+	// completes.
+	done, err, _ := r.processCanaryUpgrade(cachedDaemonSet, daemonSet, specChanged)
 	return done, err
 }
 
@@ -440,10 +471,12 @@ func (r *Reconciler) syncPodDisruptionBudgetForDeployment(deployment *appsv1.Dep
 
 	if !exists {
 		r.expectations.PodDisruptionBudget.RaiseExpectations(r.kvKey, 1, 0)
+		origPDB := podDisruptionBudget
 		podDisruptionBudget, err := pdbClient.Create(context.Background(), podDisruptionBudget, metav1.CreateOptions{})
 		if err != nil {
 			r.expectations.PodDisruptionBudget.LowerExpectations(r.kvKey, 1, 0)
-			return fmt.Errorf("unable to create poddisruptionbudget %+v: %v", podDisruptionBudget, err)
+			log.Log.V(2).Infof("failed to create poddisruptionbudget %s: %+v", origPDB.Name, origPDB)
+			return fmt.Errorf("unable to create poddisruptionbudget %s: %v", origPDB.Name, err)
 		}
 		log.Log.V(2).Infof("poddisruptionbudget %v created", podDisruptionBudget.GetName())
 		SetGeneration(&kv.Status.Generations, podDisruptionBudget)
@@ -470,9 +503,11 @@ func (r *Reconciler) syncPodDisruptionBudgetForDeployment(deployment *appsv1.Dep
 		return err
 	}
 
+	prePatchPDB := podDisruptionBudget
 	podDisruptionBudget, err = pdbClient.Patch(context.Background(), podDisruptionBudget.Name, types.JSONPatchType, patchBytes, metav1.PatchOptions{})
 	if err != nil {
-		return fmt.Errorf("unable to patch/delete poddisruptionbudget %+v: %v", podDisruptionBudget, err)
+		log.Log.V(2).Infof("failed to patch/delete poddisruptionbudget %s: %+v", prePatchPDB.Name, prePatchPDB)
+		return fmt.Errorf("unable to patch/delete poddisruptionbudget %s: %v", prePatchPDB.Name, err)
 	}
 
 	SetGeneration(&kv.Status.Generations, podDisruptionBudget)

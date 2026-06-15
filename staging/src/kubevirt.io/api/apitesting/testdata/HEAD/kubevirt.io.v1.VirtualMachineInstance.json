@@ -81,7 +81,11 @@
           "pageSize": "pageSizeValue"
         },
         "guest": "0",
-        "maxGuest": "0"
+        "maxGuest": "0",
+        "reservedOverhead": {
+          "addedOverhead": "0",
+          "memLock": "memLockValue"
+        }
       },
       "machine": {
         "type": "typeValue"
@@ -277,6 +281,7 @@
             "sriov": {},
             "macvtap": {},
             "passt": {},
+            "passtBinding": {},
             "binding": {
               "name": "nameValue"
             },
@@ -398,7 +403,8 @@
         },
         "snp": {},
         "tdx": {}
-      }
+      },
+      "rebootPolicy": "rebootPolicyValue"
     },
     "nodeSelector": {
       "nodeSelectorKey": "nodeSelectorValue"
@@ -775,6 +781,10 @@
           "claimName": "claimNameValue",
           "readOnly": true,
           "hotpluggable": true
+        },
+        "containerPath": {
+          "path": "pathValue",
+          "readOnly": true
         }
       }
     ],
@@ -1038,7 +1048,8 @@
         ],
         "nodeTopology": "nodeTopologyValue"
       },
-      "migrationNetworkType": "migrationNetworkTypeValue"
+      "migrationNetworkType": "migrationNetworkTypeValue",
+      "targetMemoryOverhead": "0"
     },
     "migrationMethod": "migrationMethodValue",
     "migrationTransport": "migrationTransportValue",
@@ -1113,7 +1124,8 @@
     "memory": {
       "guestAtBoot": "0",
       "guestCurrent": "0",
-      "guestRequested": "0"
+      "guestRequested": "0",
+      "memoryOverhead": "0"
     },
     "migratedVolumes": [
       {
@@ -1150,34 +1162,6 @@
         }
       }
     ],
-    "deviceStatus": {
-      "gpuStatuses": [
-        {
-          "name": "nameValue",
-          "deviceResourceClaimStatus": {
-            "name": "nameValue",
-            "resourceClaimName": "resourceClaimNameValue",
-            "attributes": {
-              "pciAddress": "pciAddressValue",
-              "mDevUUID": "mDevUUIDValue"
-            }
-          }
-        }
-      ],
-      "hostDeviceStatuses": [
-        {
-          "name": "nameValue",
-          "deviceResourceClaimStatus": {
-            "name": "nameValue",
-            "resourceClaimName": "resourceClaimNameValue",
-            "attributes": {
-              "pciAddress": "pciAddressValue",
-              "mDevUUID": "mDevUUIDValue"
-            }
-          }
-        }
-      ]
-    },
     "changedBlockTracking": {
       "state": "stateValue",
       "backupStatus": {
@@ -1185,8 +1169,17 @@
         "startTimestamp": "1986-01-01T01:01:01Z",
         "endTimestamp": "1988-01-01T01:01:01Z",
         "completed": true,
+        "failed": true,
         "backupMsg": "backupMsgValue",
-        "checkpointName": "checkpointNameValue"
+        "checkpointName": "checkpointNameValue",
+        "volumes": [
+          {
+            "volumeName": "volumeNameValue",
+            "diskTarget": "diskTargetValue",
+            "dataEndpoint": "dataEndpointValue",
+            "mapEndpoint": "mapEndpointValue"
+          }
+        ]
       }
     }
   }

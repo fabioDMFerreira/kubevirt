@@ -35,7 +35,7 @@ templator=${TESTS_OUT_DIR}/tools/manifest-templator
 
 if [ "${KUBEVIRT_NO_BAZEL}" != "true" ]; then
     bazel run \
-        --config=${HOST_ARCHITECTURE} \
+        --config=${HOST_ARCHITECTURE} ${BAZEL_CS_CONFIG} \
         //:build-manifest-templator -- ${templator}
 else
     (cd ${KUBEVIRT_DIR}/tools/manifest-templator/ && go_build && cp manifest-templator ${templator})
@@ -55,6 +55,7 @@ done
 bundle_out_dir=${MANIFESTS_OUT_DIR}/release/olm/bundle
 
 # then process variables
+templator_extra_flags="${TEMPLATOR_EXTRA_FLAGS:-}"
 args=$(cd ${KUBEVIRT_DIR}/manifests && find . -type f -name "*.yaml.in.tmp")
 for arg in $args; do
 
@@ -92,6 +93,8 @@ for arg in $args; do
         --quay-repository=${QUAY_REPOSITORY} \
         --runbook-url-template=${runbook_url_template} \
         --verbosity=${verbosity} \
+        --hypervisor=${hypervisor} \
+        ${templator_extra_flags} \
         >${outfile}
 done
 

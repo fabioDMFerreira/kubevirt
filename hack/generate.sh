@@ -194,7 +194,8 @@ ${KUBEVIRT_DIR}/tools/resource-generator/resource-generator --type=priorityclass
 ${KUBEVIRT_DIR}/tools/resource-generator/resource-generator --type=kv >${ResourceDir}/kv-resource.yaml
 ${KUBEVIRT_DIR}/tools/resource-generator/resource-generator --type=networkpolicies --namespace='{{.Namespace}}' >${ResourceDir}/kubevirt-network-policies.yaml.in
 ${KUBEVIRT_DIR}/tools/resource-generator/resource-generator --type=kv-cr --namespace='{{.Namespace}}' --pullPolicy='{{.ImagePullPolicy}}' \
-    --featureGates='{{.FeatureGates}}' --infraReplicas='{{.InfraReplicas}}' >${ResourceDir}/kubevirt-cr.yaml.in
+    --featureGates='{{.FeatureGates}}' --infraReplicas='{{.InfraReplicas}}' \
+    --hypervisor='{{.Hypervisor}}' >${ResourceDir}/kubevirt-cr.yaml.in
 ${KUBEVIRT_DIR}/tools/resource-generator/resource-generator --type=operator-rbac --namespace='{{.Namespace}}' >${ResourceDir}/rbac-operator.authorization.k8s.yaml.in
 
 # The generation code for CSV requires a valid semver to be used.
@@ -204,6 +205,7 @@ ${KUBEVIRT_DIR}/tools/resource-generator/resource-generator --type=operator-rbac
 # values after the file is generated.
 _fake_replaces_csv_version="1111.1111.1111"
 _fake_csv_version="2222.2222.2222"
+csv_generator_extra_flags="${CSV_GENERATOR_EXTRA_FLAGS:-}"
 ${KUBEVIRT_DIR}/tools/csv-generator/csv-generator \
     --operatorImageVersion="{{.DockerTag}}" \
     --csvCreatedAtTimestamp={{.CreatedAt}} \
@@ -215,6 +217,7 @@ ${KUBEVIRT_DIR}/tools/csv-generator/csv-generator \
     --pullPolicy={{.ImagePullPolicy}} \
     --replacesCsvVersion="$_fake_replaces_csv_version" \
     --verbosity={{.Verbosity}} \
+    ${csv_generator_extra_flags} \
     >${KUBEVIRT_DIR}/manifests/generated/operator-csv.yaml.in
 
 sed -i "s/$_fake_csv_version/{{.CsvVersion}}/g" ${KUBEVIRT_DIR}/manifests/generated/operator-csv.yaml.in
@@ -230,5 +233,6 @@ ${KUBEVIRT_DIR}/hack/gen-proto.sh
 mockgen -source pkg/handler-launcher-com/notify/info/info.pb.go -package=info -destination=pkg/handler-launcher-com/notify/info/generated_mock_info.go
 mockgen -source pkg/handler-launcher-com/cmd/info/info.pb.go -package=info -destination=pkg/handler-launcher-com/cmd/info/generated_mock_info.go
 mockgen -source pkg/handler-launcher-com/cmd/v1/cmd.pb.go -package=v1 -destination=pkg/handler-launcher-com/cmd/v1/generated_mock_cmd.go
+mockgen -source pkg/storage/cbt/nbd/v1/nbd.pb.go -package=v1 -destination=pkg/storage/cbt/nbd/v1/generated_mock_nbd.go
 
 ${KUBEVIRT_DIR}/hack/bazel-race.sh

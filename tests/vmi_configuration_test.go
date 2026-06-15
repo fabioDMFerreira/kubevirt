@@ -47,6 +47,8 @@ import (
 	"kubevirt.io/client-go/kubecli"
 	"kubevirt.io/client-go/log"
 
+	"kubevirt.io/kubevirt/pkg/hypervisor"
+	"kubevirt.io/kubevirt/pkg/hypervisor/kvm"
 	"kubevirt.io/kubevirt/pkg/libvmi"
 	libvmici "kubevirt.io/kubevirt/pkg/libvmi/cloudinit"
 	"kubevirt.io/kubevirt/pkg/pointer"
@@ -291,7 +293,7 @@ var _ = Describe("[sig-compute]Configurations", decorators.SigCompute, func() {
 				}, 60)).To(Succeed(), "should report number of sockets")
 			})
 
-			It("[test_id:1663]should report 2 vCPUs under guest OS", func() {
+			It("[test_id:1663]should report 2 vCPUs under guest OS", decorators.WgS390x, func() {
 				vmi := libvmifact.NewAlpine(
 					libvmi.WithCPUCount(1, 1, 2),
 					libvmi.WithMemoryRequest("128M"),
@@ -868,22 +870,6 @@ var _ = Describe("[sig-compute]Configurations", decorators.SigCompute, func() {
 					&expect.BExp{R: "virtio_rng"},
 				}, 400)).To(Succeed())
 			})
-
-			It("[test_id:1675]should not have the virtio rng device when not present", func() {
-				By("Starting a VirtualMachineInstance")
-				rngVmi, err := virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(nil)).Create(context.Background(), libvmifact.NewAlpine(withNoRng()), metav1.CreateOptions{})
-				Expect(err).ToNot(HaveOccurred())
-				libwait.WaitForSuccessfulVMIStart(rngVmi)
-
-				By("Expecting the VirtualMachineInstance console")
-				Expect(console.LoginToAlpine(rngVmi)).To(Succeed())
-
-				By("Checking the virtio rng presence")
-				Expect(console.SafeExpectBatch(rngVmi, []expect.Batcher{
-					&expect.BSnd{S: "[[ ! -e /sys/devices/virtual/misc/hw_random/rng_available ]] && echo non\n"},
-					&expect.BExp{R: console.RetValue("non")},
-				}, 400)).To(Succeed())
-			})
 		})
 
 		Context("[rfe_id:140][crit:medium][vendor:cnv-qe@redhat.com][level:component]with guestAgent", func() {
@@ -920,18 +906,14 @@ var _ = Describe("[sig-compute]Configurations", decorators.SigCompute, func() {
 				Expect(err).ToNot(HaveOccurred(), "Should create VMI successfully")
 				libwait.WaitForSuccessfulVMIStart(agentVMI)
 
-				getOptions := metav1.GetOptions{}
-				var freshVMI *v1.VirtualMachineInstance
+				By("Logging in to the guest")
+				Expect(console.LoginToAlpine(agentVMI)).To(Succeed())
 
-				freshVMI, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(agentVMI)).Get(context.Background(), agentVMI.Name, getOptions)
-				Expect(err).ToNot(HaveOccurred(), "Should get VMI ")
-
-				domXML, err := libdomain.GetRunningVirtualMachineInstanceDomainXML(virtClient, freshVMI)
-				Expect(err).ToNot(HaveOccurred(), "Should return XML from VMI")
-
-				Expect(domXML).To(ContainSubstring("<channel type='unix'>"), "Should contain at least one channel")
-				Expect(domXML).To(ContainSubstring("<target type='virtio' name='org.qemu.guest_agent.0' state='disconnected'/>"), "Should have guest agent channel present")
-				Expect(domXML).To(ContainSubstring("<alias name='channel0'/>"), "Should have guest channel present")
+				By("Verifying the guest agent virtio-serial port is visible inside the guest")
+				Expect(console.SafeExpectBatch(agentVMI, []expect.Batcher{
+					&expect.BSnd{S: "cat /sys/class/virtio-ports/*/name 2>/dev/null | grep -c org.qemu.guest_agent.0\n"},
+					&expect.BExp{R: console.RetValue("1")},
+				}, 30)).To(Succeed(), "Guest agent virtio-serial port should be present in the guest")
 			})
 
 			It("[test_id:1677]VMI condition should signal agent presence", func() {
@@ -1309,8 +1291,9 @@ var _ = Describe("[sig-compute]Configurations", decorators.SigCompute, func() {
 				requestWithoutHeadroom := getComputeMemoryRequest(vmiWithoutHeadroom)
 				requestWithHeadroom := getComputeMemoryRequest(vmiWithHeadroom)
 
-				overheadWithoutHeadroom := services.GetMemoryOverhead(vmiWithoutHeadroom, runtime.GOARCH, nil)
-				overheadWithHeadroom := services.GetMemoryOverhead(vmiWithoutHeadroom, runtime.GOARCH, pointer.P(ratio))
+				kvmLauncherRenderer := hypervisor.NewLauncherHypervisorResources(v1.KvmHypervisorName)
+				overheadWithoutHeadroom := kvmLauncherRenderer.GetMemoryOverhead(vmiWithoutHeadroom, runtime.GOARCH, nil)
+				overheadWithHeadroom := kvmLauncherRenderer.GetMemoryOverhead(vmiWithoutHeadroom, runtime.GOARCH, pointer.P(ratio))
 
 				expectedDiffBetweenRequests := overheadWithHeadroom.DeepCopy()
 				expectedDiffBetweenRequests.Sub(overheadWithoutHeadroom)
@@ -1634,7 +1617,7 @@ var _ = Describe("[sig-compute]Configurations", decorators.SigCompute, func() {
 					libvmi.WithCPUCount(1, 1, 1),
 				)
 
-				vmiPodRequest := services.GetMemoryOverhead(vmi, runtime.GOARCH, nil)
+				vmiPodRequest := hypervisor.NewLauncherHypervisorResources(v1.KvmHypervisorName).GetMemoryOverhead(vmi, runtime.GOARCH, nil)
 				vmiPodRequest.Add(vmiRequest)
 				value := int64(float64(vmiPodRequest.Value()) * services.DefaultMemoryLimitOverheadRatio)
 
@@ -2216,7 +2199,7 @@ var _ = Describe("[sig-compute]Configurations", decorators.SigCompute, func() {
 		})
 	})
 
-	Context("[rfe_id:2926][crit:medium][vendor:cnv-qe@redhat.com][level:component]Check SMBios with default and custom values", func() {
+	Context("[rfe_id:2926][crit:medium][vendor:cnv-qe@redhat.com][level:component]Check SMBios with default and custom values", decorators.WgArm64, func() {
 
 		It("[test_id:2751]test default SMBios", func() {
 			kv := libkubevirt.GetCurrentKv(virtClient)
@@ -2420,11 +2403,11 @@ var _ = Describe("[sig-compute]Configurations", decorators.SigCompute, func() {
 			}
 
 			By("Ensuring no process is using too much ram")
-			doesntExceedMemoryUsage(&processRss, "virt-launcher-monitor", resource.MustParse(services.VirtLauncherMonitorOverhead))
-			doesntExceedMemoryUsage(&processRss, "virt-launcher", resource.MustParse(services.VirtLauncherOverhead))
-			doesntExceedMemoryUsage(&processRss, "virtlogd", resource.MustParse(services.VirtlogdOverhead))
-			doesntExceedMemoryUsage(&processRss, "virtqemud", resource.MustParse(services.VirtqemudOverhead))
-			qemuExpected := resource.MustParse(services.QemuOverhead)
+			doesntExceedMemoryUsage(&processRss, "virt-launcher-monitor", resource.MustParse(kvm.VirtLauncherMonitorOverhead))
+			doesntExceedMemoryUsage(&processRss, "virt-launcher", resource.MustParse(kvm.VirtLauncherOverhead))
+			doesntExceedMemoryUsage(&processRss, "virtlogd", resource.MustParse(kvm.VirtlogdOverhead))
+			doesntExceedMemoryUsage(&processRss, "virtqemud", resource.MustParse(kvm.VirtqemudOverhead))
+			qemuExpected := resource.MustParse(kvm.QemuOverhead)
 			qemuExpected.Add(vmi.Spec.Domain.Resources.Requests[k8sv1.ResourceMemory])
 			doesntExceedMemoryUsage(&processRss, "qemu", qemuExpected)
 		})

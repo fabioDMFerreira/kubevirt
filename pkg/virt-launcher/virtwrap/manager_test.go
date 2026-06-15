@@ -38,6 +38,7 @@ import (
 	"libvirt.org/go/libvirt"
 	"libvirt.org/go/libvirtxml"
 
+	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/disksource"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/network"
 
 	k8sv1 "k8s.io/api/core/v1"
@@ -65,6 +66,7 @@ import (
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/cli"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/converter"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/converter/arch"
+	convertertypes "kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/converter/types"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/converter/vcpu"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/efi"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/stats"
@@ -109,7 +111,7 @@ var _ = Describe("Manager", func() {
 	testDomainName := fmt.Sprintf("%s_%s", testNamespace, testVmName)
 	ephemeralDiskCreatorMock := &fake.MockEphemeralDiskImageCreator{}
 	newLibvirtDomainManagerDefault := func() (DomainManager, error) {
-		return NewLibvirtDomainManager(mockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, nil, "/usr/share/OVMF", ephemeralDiskCreatorMock, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil)
+		return NewLibvirtDomainManager(mockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, nil, "/usr/share/OVMF", ephemeralDiskCreatorMock, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil, v1.KvmHypervisorName)
 	}
 
 	BeforeEach(func() {
@@ -416,7 +418,7 @@ var _ = Describe("Manager", func() {
 		freePageReportingDisabled := clusterConfig.IsFreePageReportingDisabled()
 		serialConsoleLogDisabled := clusterConfig.IsSerialConsoleLogDisabled()
 
-		c := &converter.ConverterContext{
+		c := &convertertypes.ConverterContext{
 			Architecture:      arch.NewConverter(runtime.GOARCH),
 			VirtualMachine:    vmi,
 			AllowEmulation:    true,
@@ -443,22 +445,63 @@ var _ = Describe("Manager", func() {
 	Context("on successful VirtualMachineInstance sync", func() {
 
 		addPlaceHolderInterfaces := func(vmi *v1.VirtualMachineInstance, domainSpec *api.DomainSpec) *api.DomainSpec {
-			count, err := calculateHotplugPortCount(vmi, domainSpec)
+			placeholderCount, err := calculatePlaceholderCount(vmi)
 			Expect(err).ToNot(HaveOccurred())
-			return network.AppendPlaceholderInterfacesToTheDomain(vmi, domainSpec, count)
+			return network.AppendPlaceholderInterfacesToTheDomain(vmi, domainSpec, placeholderCount)
+		}
+
+		// expectExtraControllers sets up the DomainDefineXML expectation for the
+		// extra pcie-root-port controllers that are added after WithNetworkIfacesResources.
+		// It modifies domainSpec in place (appending controllers) so callers can
+		// marshal the updated spec for subsequent expectations if needed.
+		expectExtraControllers := func(vmi *v1.VirtualMachineInstance, domainSpec *api.DomainSpec) {
+			placeholderCount, err := calculatePlaceholderCount(vmi)
+			Expect(err).ToNot(HaveOccurred())
+			extraControllers, err := calculateExtraControllerCount(vmi, domainSpec, placeholderCount)
+			Expect(err).ToNot(HaveOccurred())
+			if extraControllers > 0 {
+				appendPCIeRootPortControllers(domainSpec, extraControllers)
+				// The xmlns:qemu attribute is lost during the XML marshal/unmarshal
+				// round-trip in SetDomainSpecStrWithHooks, so clear it to match
+				// the production code behavior for subsequent defines.
+				domainSpec.XmlNS = ""
+				domainXMLWithExtra, err := xml.MarshalIndent(domainSpec, "", "\t")
+				Expect(err).ToNot(HaveOccurred())
+				mockLibvirt.ConnectionEXPECT().DomainDefineXML(string(domainXMLWithExtra)).DoAndReturn(mockDomainWithFreeExpectation)
+			}
 		}
 
 		setDomainExpectations := func(vmi *v1.VirtualMachineInstance) {
 			domainSpec := expectedDomainFor(vmi)
+			placeholderCount, err := calculatePlaceholderCount(vmi)
+			Expect(err).ToNot(HaveOccurred())
+			extraControllers, err := calculateExtraControllerCount(vmi, domainSpec, placeholderCount)
+			Expect(err).ToNot(HaveOccurred())
 			domainSpecWithPlaceholderInterfaces := addPlaceHolderInterfaces(vmi, domainSpec)
 			domainXML, err := xml.MarshalIndent(domainSpec, "", "\t")
 			Expect(err).ToNot(HaveOccurred())
-			domainXMLWithInterfaces, err := xml.MarshalIndent(domainSpecWithPlaceholderInterfaces, "", "\t")
-			Expect(err).ToNot(HaveOccurred())
+			if placeholderCount > 0 {
+				// WithNetworkIfacesResources defines with placeholders first,
+				// then re-defines without placeholders.
+				domainXMLWithInterfaces, err := xml.MarshalIndent(domainSpecWithPlaceholderInterfaces, "", "\t")
+				Expect(err).ToNot(HaveOccurred())
+				mockLibvirt.ConnectionEXPECT().DomainDefineXML(string(domainXMLWithInterfaces)).DoAndReturn(mockDomainWithFreeExpectation)
+				mockLibvirt.DomainEXPECT().GetXMLDesc(libvirt.DomainXMLFlags(2)).MaxTimes(1).Return(string(domainXMLWithInterfaces), nil)
+			}
 			mockLibvirt.ConnectionEXPECT().DomainDefineXML(string(domainXML)).DoAndReturn(mockDomainWithFreeExpectation)
-			mockLibvirt.ConnectionEXPECT().DomainDefineXML(string(domainXMLWithInterfaces)).DoAndReturn(mockDomainWithFreeExpectation)
+			if extraControllers > 0 {
+				// Extra controllers are added after WithNetworkIfacesResources,
+				// requiring a third DomainDefineXML call.
+				appendPCIeRootPortControllers(domainSpec, extraControllers)
+				// The xmlns:qemu attribute is lost during the XML marshal/unmarshal
+				// round-trip in SetDomainSpecStrWithHooks, so clear it to match
+				// the production code behavior for subsequent defines.
+				domainSpec.XmlNS = ""
+				domainXMLWithExtra, err := xml.MarshalIndent(domainSpec, "", "\t")
+				Expect(err).ToNot(HaveOccurred())
+				mockLibvirt.ConnectionEXPECT().DomainDefineXML(string(domainXMLWithExtra)).DoAndReturn(mockDomainWithFreeExpectation)
+			}
 			mockLibvirt.DomainEXPECT().GetXMLDesc(libvirt.DomainXMLFlags(0)).MaxTimes(2).Return(string(domainXML), nil)
-			mockLibvirt.DomainEXPECT().GetXMLDesc(libvirt.DomainXMLFlags(2)).MaxTimes(1).Return(string(domainXMLWithInterfaces), nil)
 		}
 
 		It("should define and start a new VirtualMachineInstance", func() {
@@ -638,7 +681,7 @@ var _ = Describe("Manager", func() {
 				func() {
 					isFreeCalled <- true
 				})
-			manager, _ := NewLibvirtDomainManager(mockLibvirt.VirtConnection, "fake", "fake", nil, "/usr/share/OVMF", ephemeralDiskCreatorMock, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil)
+			manager, _ := NewLibvirtDomainManager(mockLibvirt.VirtConnection, "fake", "fake", nil, "/usr/share/OVMF", ephemeralDiskCreatorMock, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil, v1.KvmHypervisorName)
 			Expect(manager.UnpauseVMI(vmi)).To(Succeed())
 			Eventually(func() bool {
 				select {
@@ -732,7 +775,7 @@ var _ = Describe("Manager", func() {
 			mockLibvirt.DomainEXPECT().CreateWithFlags(libvirt.DOMAIN_NONE).Return(nil)
 			mockLibvirt.DomainEXPECT().GetXMLDesc(libvirt.DomainXMLFlags(0)).MaxTimes(2).Return(string(xmlDomain), nil)
 			mockLibvirt.DomainEXPECT().GetXMLDesc(libvirt.DomainXMLFlags(2)).MaxTimes(1).Return(string(domainXMLWithInterfaces), nil)
-			manager, _ := newLibvirtDomainManager(mockLibvirt.VirtConnection, "fake", "fake", nil, "/usr/share/OVMF", ephemeralDiskCreatorMock, mockDirectIOChecker, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil)
+			manager, _ := newLibvirtDomainManager(mockLibvirt.VirtConnection, "fake", "fake", nil, "/usr/share/OVMF", ephemeralDiskCreatorMock, mockDirectIOChecker, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil, v1.KvmHypervisorName)
 			newspec, err := manager.SyncVMI(vmi, true, &cmdv1.VirtualMachineOptions{
 				VirtualMachineSMBios: &cmdv1.SMBios{},
 				PreallocatedVolumes:  []string{"permvolume1"},
@@ -802,11 +845,9 @@ var _ = Describe("Manager", func() {
 			}
 			mockLibvirt.ConnectionEXPECT().LookupDomainByName(testDomainName).Return(nil, libvirt.Error{Code: libvirt.ERR_NO_DOMAIN})
 			domainSpec := expectedDomainFor(vmi)
-			xmlDomain, err := xml.MarshalIndent(domainSpec, "", "\t")
-			Expect(err).ToNot(HaveOccurred())
-			domainSpecWithPlaceholderInterfaces := addPlaceHolderInterfaces(vmi, domainSpec)
-			domainXMLWithInterfaces, err := xml.MarshalIndent(domainSpecWithPlaceholderInterfaces, "", "\t")
-			Expect(err).ToNot(HaveOccurred())
+			addPlaceHolderInterfaces(vmi, domainSpec)
+			mockLibvirt.ConnectionEXPECT().DomainDefineXML(gomock.Any()).DoAndReturn(mockDomainWithFreeExpectation)
+			expectExtraControllers(vmi, domainSpec)
 			checkIfDiskReadyToUse = func(filename string) (bool, error) {
 				Expect(filename).To(Equal(filepath.Join(v1.HotplugDiskDir, "/hpvolume1.img")))
 				return true, nil
@@ -860,14 +901,11 @@ var _ = Describe("Manager", func() {
 			Expect(err).ToNot(HaveOccurred())
 			attachBytes, err := xml.Marshal(attachDisk)
 			Expect(err).ToNot(HaveOccurred())
-			mockLibvirt.ConnectionEXPECT().DomainDefineXML(string(xmlDomain)).DoAndReturn(mockDomainWithFreeExpectation)
-			mockLibvirt.ConnectionEXPECT().DomainDefineXML(string(domainXMLWithInterfaces)).DoAndReturn(mockDomainWithFreeExpectation)
 			mockLibvirt.DomainEXPECT().GetState().Return(libvirt.DOMAIN_SHUTDOWN, 1, nil)
 			mockLibvirt.DomainEXPECT().CreateWithFlags(libvirt.DOMAIN_NONE).Return(nil)
 			mockLibvirt.DomainEXPECT().AttachDeviceFlags(strings.ToLower(string(attachBytes)), affectDeviceLiveAndConfigLibvirtFlags)
 			mockLibvirt.DomainEXPECT().GetXMLDesc(libvirt.DomainXMLFlags(0)).MaxTimes(2).Return(string(xmlDomain2), nil)
-			mockLibvirt.DomainEXPECT().GetXMLDesc(libvirt.DomainXMLFlags(2)).MaxTimes(1).Return(string(domainXMLWithInterfaces), nil)
-			manager, _ := newLibvirtDomainManager(mockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, nil, "/usr/share/OVMF", ephemeralDiskCreatorMock, mockDirectIOChecker, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil)
+			manager, _ := newLibvirtDomainManager(mockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, nil, "/usr/share/OVMF", ephemeralDiskCreatorMock, mockDirectIOChecker, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil, v1.KvmHypervisorName)
 			newspec, err := manager.SyncVMI(vmi, true, &cmdv1.VirtualMachineOptions{VirtualMachineSMBios: &cmdv1.SMBios{}})
 			Expect(err).ToNot(HaveOccurred())
 			Expect(newspec).ToNot(BeNil())
@@ -975,7 +1013,7 @@ var _ = Describe("Manager", func() {
 			mockLibvirt.DomainEXPECT().CreateWithFlags(libvirt.DOMAIN_NONE).Return(nil)
 			mockLibvirt.DomainEXPECT().DetachDeviceFlags(strings.ToLower(string(detachBytes)), affectDeviceLiveAndConfigLibvirtFlags)
 			mockLibvirt.DomainEXPECT().GetXMLDesc(libvirt.DomainXMLFlags(0)).MaxTimes(2).Return(string(xmlDomain), nil)
-			manager, _ := newLibvirtDomainManager(mockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, nil, "/usr/share/OVMF", ephemeralDiskCreatorMock, mockDirectIOChecker, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil)
+			manager, _ := newLibvirtDomainManager(mockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, nil, "/usr/share/OVMF", ephemeralDiskCreatorMock, mockDirectIOChecker, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil, v1.KvmHypervisorName)
 			newspec, err := manager.SyncVMI(vmi, true, &cmdv1.VirtualMachineOptions{VirtualMachineSMBios: &cmdv1.SMBios{}})
 			Expect(err).ToNot(HaveOccurred())
 			Expect(newspec).ToNot(BeNil())
@@ -1049,7 +1087,7 @@ var _ = Describe("Manager", func() {
 			}
 			mockLibvirt.DomainEXPECT().GetState().Return(libvirt.DOMAIN_SHUTDOWN, 1, nil)
 			mockLibvirt.DomainEXPECT().CreateWithFlags(libvirt.DOMAIN_NONE).Return(nil)
-			manager, _ := newLibvirtDomainManager(mockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, nil, "/usr/share/OVMF", ephemeralDiskCreatorMock, mockDirectIOChecker, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil)
+			manager, _ := newLibvirtDomainManager(mockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, nil, "/usr/share/OVMF", ephemeralDiskCreatorMock, mockDirectIOChecker, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil, v1.KvmHypervisorName)
 			newspec, err := manager.SyncVMI(vmi, true, &cmdv1.VirtualMachineOptions{VirtualMachineSMBios: &cmdv1.SMBios{}})
 			Expect(err).ToNot(HaveOccurred())
 			Expect(newspec).ToNot(BeNil())
@@ -1117,15 +1155,13 @@ var _ = Describe("Manager", func() {
 			}
 			mockLibvirt.ConnectionEXPECT().LookupDomainByName(testDomainName).Return(nil, libvirt.Error{Code: libvirt.ERR_NO_DOMAIN})
 			domainSpec := expectedDomainFor(vmi)
-			xmlDomain, err := xml.MarshalIndent(domainSpec, "", "\t")
-			Expect(err).ToNot(HaveOccurred())
-			domainSpecWithPlaceholderInterfaces := addPlaceHolderInterfaces(vmi, domainSpec)
-			domainXMLWithInterfaces, err := xml.MarshalIndent(domainSpecWithPlaceholderInterfaces, "", "\t")
-			Expect(err).ToNot(HaveOccurred())
+			addPlaceHolderInterfaces(vmi, domainSpec)
 			checkIfDiskReadyToUse = func(filename string) (bool, error) {
 				Expect(filename).To(Equal(filepath.Join(v1.HotplugDiskDir, "hpvolume1.img")))
 				return false, nil
 			}
+			mockLibvirt.ConnectionEXPECT().DomainDefineXML(gomock.Any()).DoAndReturn(mockDomainWithFreeExpectation)
+			expectExtraControllers(vmi, domainSpec)
 			domainSpec.Devices.Disks = []api.Disk{
 				{
 					Device: "disk",
@@ -1148,13 +1184,10 @@ var _ = Describe("Manager", func() {
 			}
 			xmlDomain2, err := xml.MarshalIndent(domainSpec, "", "\t")
 			Expect(err).ToNot(HaveOccurred())
-			mockLibvirt.ConnectionEXPECT().DomainDefineXML(string(xmlDomain)).DoAndReturn(mockDomainWithFreeExpectation)
-			mockLibvirt.ConnectionEXPECT().DomainDefineXML(string(domainXMLWithInterfaces)).DoAndReturn(mockDomainWithFreeExpectation)
 			mockLibvirt.DomainEXPECT().GetState().Return(libvirt.DOMAIN_SHUTDOWN, 1, nil)
 			mockLibvirt.DomainEXPECT().CreateWithFlags(libvirt.DOMAIN_NONE).Return(nil)
 			mockLibvirt.DomainEXPECT().GetXMLDesc(libvirt.DomainXMLFlags(0)).MaxTimes(2).Return(string(xmlDomain2), nil)
-			mockLibvirt.DomainEXPECT().GetXMLDesc(libvirt.DomainXMLFlags(2)).MaxTimes(1).Return(string(domainXMLWithInterfaces), nil)
-			manager, _ := newLibvirtDomainManager(mockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, nil, "/usr/share/OVMF", ephemeralDiskCreatorMock, mockDirectIOChecker, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil)
+			manager, _ := newLibvirtDomainManager(mockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, nil, "/usr/share/OVMF", ephemeralDiskCreatorMock, mockDirectIOChecker, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil, v1.KvmHypervisorName)
 			newspec, err := manager.SyncVMI(vmi, true, &cmdv1.VirtualMachineOptions{VirtualMachineSMBios: &cmdv1.SMBios{}})
 			Expect(err).ToNot(HaveOccurred())
 			Expect(newspec).ToNot(BeNil())
@@ -1222,11 +1255,9 @@ var _ = Describe("Manager", func() {
 			}
 			mockLibvirt.ConnectionEXPECT().LookupDomainByName(testDomainName).Return(nil, libvirt.Error{Code: libvirt.ERR_NO_DOMAIN})
 			domainSpec := expectedDomainFor(vmi)
-			xmlDomain, err := xml.MarshalIndent(domainSpec, "", "\t")
-			Expect(err).ToNot(HaveOccurred())
-			domainSpecWithPlaceholderInterfaces := addPlaceHolderInterfaces(vmi, domainSpec)
-			domainXMLWithInterfaces, err := xml.MarshalIndent(domainSpecWithPlaceholderInterfaces, "", "\t")
-			Expect(err).ToNot(HaveOccurred())
+			addPlaceHolderInterfaces(vmi, domainSpec)
+			mockLibvirt.ConnectionEXPECT().DomainDefineXML(gomock.Any()).DoAndReturn(mockDomainWithFreeExpectation)
+			expectExtraControllers(vmi, domainSpec)
 			checkIfDiskReadyToUse = func(filename string) (bool, error) {
 				Expect(filename).To(Equal(filepath.Join(v1.HotplugDiskDir, "/cdrom-volume.img")))
 				return true, nil
@@ -1290,14 +1321,11 @@ var _ = Describe("Manager", func() {
 			Expect(err).ToNot(HaveOccurred())
 			updateBytes, err := xml.Marshal(updateDisk)
 			Expect(err).ToNot(HaveOccurred())
-			mockLibvirt.ConnectionEXPECT().DomainDefineXML(string(xmlDomain)).DoAndReturn(mockDomainWithFreeExpectation)
-			mockLibvirt.ConnectionEXPECT().DomainDefineXML(string(domainXMLWithInterfaces)).DoAndReturn(mockDomainWithFreeExpectation)
 			mockLibvirt.DomainEXPECT().GetState().Return(libvirt.DOMAIN_SHUTDOWN, 1, nil)
 			mockLibvirt.DomainEXPECT().CreateWithFlags(libvirt.DOMAIN_NONE).Return(nil)
 			mockLibvirt.DomainEXPECT().UpdateDeviceFlags(strings.ToLower(string(updateBytes)), affectDeviceLiveAndConfigLibvirtFlags)
 			mockLibvirt.DomainEXPECT().GetXMLDesc(libvirt.DomainXMLFlags(0)).MaxTimes(2).Return(string(xmlDomain2), nil)
-			mockLibvirt.DomainEXPECT().GetXMLDesc(libvirt.DomainXMLFlags(2)).MaxTimes(1).Return(string(domainXMLWithInterfaces), nil)
-			manager, _ := newLibvirtDomainManager(mockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, nil, "/usr/share/OVMF", ephemeralDiskCreatorMock, mockDirectIOChecker, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil)
+			manager, _ := newLibvirtDomainManager(mockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, nil, "/usr/share/OVMF", ephemeralDiskCreatorMock, mockDirectIOChecker, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil, v1.KvmHypervisorName)
 			newspec, err := manager.SyncVMI(vmi, true, &cmdv1.VirtualMachineOptions{VirtualMachineSMBios: &cmdv1.SMBios{}})
 			Expect(err).ToNot(HaveOccurred())
 			Expect(newspec).ToNot(BeNil())
@@ -1356,11 +1384,9 @@ var _ = Describe("Manager", func() {
 			}
 			mockLibvirt.ConnectionEXPECT().LookupDomainByName(testDomainName).Return(nil, libvirt.Error{Code: libvirt.ERR_NO_DOMAIN})
 			domainSpec := expectedDomainFor(vmi)
-			xmlDomain, err := xml.MarshalIndent(domainSpec, "", "\t")
-			Expect(err).ToNot(HaveOccurred())
-			domainSpecWithPlaceholderInterfaces := addPlaceHolderInterfaces(vmi, domainSpec)
-			domainXMLWithInterfaces, err := xml.MarshalIndent(domainSpecWithPlaceholderInterfaces, "", "\t")
-			Expect(err).ToNot(HaveOccurred())
+			addPlaceHolderInterfaces(vmi, domainSpec)
+			mockLibvirt.ConnectionEXPECT().DomainDefineXML(gomock.Any()).DoAndReturn(mockDomainWithFreeExpectation)
+			expectExtraControllers(vmi, domainSpec)
 			checkIfDiskReadyToUse = func(filename string) (bool, error) {
 				Expect(filename).To(Equal(filepath.Join(v1.HotplugDiskDir, "/cdrom-volume.img")))
 				return true, nil
@@ -1424,14 +1450,11 @@ var _ = Describe("Manager", func() {
 			Expect(err).ToNot(HaveOccurred())
 			updateBytes, err := xml.Marshal(updateDisk)
 			Expect(err).ToNot(HaveOccurred())
-			mockLibvirt.ConnectionEXPECT().DomainDefineXML(string(xmlDomain)).DoAndReturn(mockDomainWithFreeExpectation)
-			mockLibvirt.ConnectionEXPECT().DomainDefineXML(string(domainXMLWithInterfaces)).DoAndReturn(mockDomainWithFreeExpectation)
 			mockLibvirt.DomainEXPECT().GetState().Return(libvirt.DOMAIN_SHUTDOWN, 1, nil)
 			mockLibvirt.DomainEXPECT().CreateWithFlags(libvirt.DOMAIN_NONE).Return(nil)
 			mockLibvirt.DomainEXPECT().UpdateDeviceFlags(strings.ToLower(string(updateBytes)), affectDeviceLiveAndConfigLibvirtFlags)
 			mockLibvirt.DomainEXPECT().GetXMLDesc(libvirt.DomainXMLFlags(0)).MaxTimes(2).Return(string(xmlDomain2), nil)
-			mockLibvirt.DomainEXPECT().GetXMLDesc(libvirt.DomainXMLFlags(2)).MaxTimes(1).Return(string(domainXMLWithInterfaces), nil)
-			manager, _ := newLibvirtDomainManager(mockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, nil, "/usr/share/OVMF", ephemeralDiskCreatorMock, mockDirectIOChecker, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil)
+			manager, _ := newLibvirtDomainManager(mockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, nil, "/usr/share/OVMF", ephemeralDiskCreatorMock, mockDirectIOChecker, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil, v1.KvmHypervisorName)
 			newspec, err := manager.SyncVMI(vmi, true, &cmdv1.VirtualMachineOptions{VirtualMachineSMBios: &cmdv1.SMBios{}})
 			Expect(err).ToNot(HaveOccurred())
 			Expect(newspec).ToNot(BeNil())
@@ -1509,7 +1532,7 @@ var _ = Describe("Manager", func() {
 			defer os.RemoveAll(ovmfDir)
 			err = os.WriteFile(filepath.Join(ovmfDir, efi.EFICodeSEV), loaderBytes, 0644)
 			Expect(err).ToNot(HaveOccurred())
-			manager, _ := NewLibvirtDomainManager(mockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, nil, ovmfDir, ephemeralDiskCreatorMock, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil)
+			manager, _ := NewLibvirtDomainManager(mockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, nil, ovmfDir, ephemeralDiskCreatorMock, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil, v1.KvmHypervisorName)
 			sevMeasurementInfo, err := manager.GetLaunchMeasurement(vmi)
 			if runtime.GOARCH == "amd64" {
 				Expect(err).ToNot(HaveOccurred())
@@ -1679,6 +1702,47 @@ var _ = Describe("Manager", func() {
 			})
 
 			Expect(actualGracePeriod).To(Equal(updatedGracePeriod))
+		})
+
+		It("should not resize a disk with overlay using DOMAIN_BLOCK_RESIZE_CAPACITY", func() {
+			localCtrl := gomock.NewController(GinkgoT())
+			localMockLibvirt := testing.NewLibvirt(localCtrl)
+
+			vmi := newVMI(testNamespace, testVmName)
+			domainSpec := expectedDomainFor(vmi)
+			domainSpec.Devices.Disks = append(domainSpec.Devices.Disks, api.Disk{
+				Device: "disk",
+				Type:   "file",
+				Source: api.DiskSource{
+					File: "/test/overlay.qcow2",
+					DataStore: &api.DataStore{
+						Type:   "block",
+						Source: &api.DiskSource{Dev: "/dev/vda"},
+					},
+				},
+				Target: api.DiskTarget{Bus: v1.DiskBusVirtio, Device: "vda"},
+				Driver: &api.DiskDriver{Name: "qemu", Type: "qcow2"},
+				Alias:  api.NewUserDefinedAlias("test-disk"),
+			})
+			xml, err := xml.MarshalIndent(domainSpec, "", "\t")
+			Expect(err).NotTo(HaveOccurred())
+
+			localMockLibvirt.ConnectionEXPECT().LookupDomainByName(testDomainName).DoAndReturn(func(_ string) (cli.VirDomain, error) {
+				localMockLibvirt.DomainEXPECT().Free()
+				return localMockLibvirt.VirtDomain, nil
+			})
+			localMockLibvirt.DomainEXPECT().GetState().Return(libvirt.DOMAIN_RUNNING, 1, nil)
+			localMockLibvirt.DomainEXPECT().GetXMLDesc(libvirt.DomainXMLFlags(0)).Return(string(xml), nil)
+			localMockLibvirt.DomainEXPECT().GetBlockInfo(gomock.Any(), gomock.Any()).AnyTimes().Return(&libvirt.DomainBlockInfo{
+				Capacity: 10 * 1024 * 1024 * 1024,
+				Physical: 20 * 1024 * 1024 * 1024,
+			}, nil)
+
+			manager, err := NewLibvirtDomainManager(localMockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, nil, "/usr/share/OVMF", ephemeralDiskCreatorMock, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil, v1.KvmHypervisorName)
+			Expect(err).ToNot(HaveOccurred())
+			newspec, err := manager.SyncVMI(vmi, true, &cmdv1.VirtualMachineOptions{VirtualMachineSMBios: &cmdv1.SMBios{}})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(newspec).ToNot(BeNil())
 		})
 	})
 
@@ -2204,8 +2268,8 @@ var _ = Describe("Manager", func() {
 		DescribeTable("should try to undefine a VirtualMachineInstance in state",
 			func(state libvirt.DomainState) {
 				mockLibvirt.ConnectionEXPECT().LookupDomainByName(testDomainName).DoAndReturn(mockDomainWithFreeExpectation)
-				mockLibvirt.DomainEXPECT().UndefineFlags(libvirt.DOMAIN_UNDEFINE_KEEP_NVRAM).Return(nil)
-				manager, _ := NewLibvirtDomainManager(mockLibvirt.VirtConnection, "fake", "fake", nil, "/usr/share/", ephemeralDiskCreatorMock, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil)
+				mockLibvirt.DomainEXPECT().UndefineFlags(libvirt.DOMAIN_UNDEFINE_KEEP_NVRAM | libvirt.DOMAIN_UNDEFINE_CHECKPOINTS_METADATA).Return(nil)
+				manager, _ := NewLibvirtDomainManager(mockLibvirt.VirtConnection, "fake", "fake", nil, "/usr/share/", ephemeralDiskCreatorMock, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil, v1.KvmHypervisorName)
 				Expect(manager.DeleteVMI(newVMI(testNamespace, testVmName))).To(Succeed())
 			},
 			Entry("crashed", libvirt.DOMAIN_CRASHED),
@@ -2363,7 +2427,7 @@ var _ = Describe("Manager", func() {
 
 			BeforeEach(func() {
 				agentStore = agentpoller.NewAsyncAgentStore()
-				libvirtmanager, _ = NewLibvirtDomainManager(mockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, &agentStore, "/usr/share/OVMF", ephemeralDiskCreatorMock, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil)
+				libvirtmanager, _ = NewLibvirtDomainManager(mockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, &agentStore, "/usr/share/OVMF", ephemeralDiskCreatorMock, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil, v1.KvmHypervisorName)
 			})
 
 			It("should report nil when no OS info exists in the cache", func() {
@@ -2387,7 +2451,7 @@ var _ = Describe("Manager", func() {
 
 			BeforeEach(func() {
 				agentStore = agentpoller.NewAsyncAgentStore()
-				libvirtmanager, _ = NewLibvirtDomainManager(mockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, &agentStore, "/usr/share/OVMF", ephemeralDiskCreatorMock, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil)
+				libvirtmanager, _ = NewLibvirtDomainManager(mockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, &agentStore, "/usr/share/OVMF", ephemeralDiskCreatorMock, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil, v1.KvmHypervisorName)
 			})
 
 			It("should return nil when no interfaces exists in the cache", func() {
@@ -2431,7 +2495,7 @@ var _ = Describe("Manager", func() {
 				},
 			},
 		})
-		manager, _ := NewLibvirtDomainManager(mockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, &agentStore, "/usr/share/OVMF", ephemeralDiskCreatorMock, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil)
+		manager, _ := NewLibvirtDomainManager(mockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, &agentStore, "/usr/share/OVMF", ephemeralDiskCreatorMock, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil, v1.KvmHypervisorName)
 
 		// we need the non-typecast object to make the function we want to test available
 		libvirtmanager := manager.(*LibvirtDomainManager)
@@ -2467,7 +2531,7 @@ var _ = Describe("Manager", func() {
 			},
 		})
 
-		manager, _ := NewLibvirtDomainManager(mockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, &agentStore, "/usr/share/OVMF", ephemeralDiskCreatorMock, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil)
+		manager, _ := NewLibvirtDomainManager(mockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, &agentStore, "/usr/share/OVMF", ephemeralDiskCreatorMock, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil, v1.KvmHypervisorName)
 
 		// we need the non-typecast object to make the function we want to test available
 		libvirtmanager := manager.(*LibvirtDomainManager)
@@ -2494,7 +2558,7 @@ var _ = Describe("Manager", func() {
 			},
 		})
 
-		manager, _ := NewLibvirtDomainManager(mockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, &agentStore, "/usr/share/OVMF", ephemeralDiskCreatorMock, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil)
+		manager, _ := NewLibvirtDomainManager(mockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, &agentStore, "/usr/share/OVMF", ephemeralDiskCreatorMock, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil, v1.KvmHypervisorName)
 
 		// we need the non-typecast object to make the function we want to test available
 		libvirtmanager := manager.(*LibvirtDomainManager)
@@ -2521,7 +2585,7 @@ var _ = Describe("Manager", func() {
 			},
 		})
 
-		manager, _ := NewLibvirtDomainManager(mockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, &agentStore, "/usr/share/OVMF", ephemeralDiskCreatorMock, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil)
+		manager, _ := NewLibvirtDomainManager(mockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, &agentStore, "/usr/share/OVMF", ephemeralDiskCreatorMock, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil, v1.KvmHypervisorName)
 
 		// we need the non-typecast object to make the function we want to test available
 		libvirtmanager := manager.(*LibvirtDomainManager)
@@ -2567,7 +2631,7 @@ var _ = Describe("Manager", func() {
 			},
 		})
 
-		manager, _ := NewLibvirtDomainManager(mockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, &agentStore, "/usr/share/OVMF", ephemeralDiskCreatorMock, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil)
+		manager, _ := NewLibvirtDomainManager(mockLibvirt.VirtConnection, testVirtShareDir, testEphemeralDiskDir, &agentStore, "/usr/share/OVMF", ephemeralDiskCreatorMock, metadataCache, nil, virtconfig.DefaultDiskVerificationMemoryLimitBytes, fakeCpuSetGetter, false, false, nil, v1.KvmHypervisorName)
 
 		// we need the non-typecast object to make the function we want to test available
 		libvirtmanager := manager.(*LibvirtDomainManager)
@@ -2585,6 +2649,250 @@ var _ = Describe("Manager", func() {
 
 		err := libvirtmanager.generateCloudInitEmptyISO(vmi, nil)
 		Expect(err).To(MatchError(ContainSubstring("failed to find the status of volume test1")))
+	})
+
+	Context("PCINUMAAwareTopology feature gate integration", func() {
+		var vmi *v1.VirtualMachineInstance
+		var manager DomainManager
+
+		BeforeEach(func() {
+			vmi = newVMI(testNamespace, testVmName)
+			var err error
+			manager, err = newLibvirtDomainManagerDefault()
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("should set PCINUMAAwareTopologyEnabled=true when feature gate is enabled", func() {
+			clusterConfig := &cmdv1.ClusterConfig{
+				PCINUMAAwareTopologyEnabled: true,
+			}
+
+			options := &cmdv1.VirtualMachineOptions{
+				VirtualMachineSMBios: &cmdv1.SMBios{},
+				ClusterConfig:        clusterConfig,
+			}
+
+			libvirtManager := manager.(*LibvirtDomainManager)
+			converterContext, err := libvirtManager.generateConverterContext(vmi, true, options, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			Expect(converterContext.PCINUMAAwareTopologyEnabled).To(BeTrue())
+		})
+
+		It("should set PCINUMAAwareTopologyEnabled=false when feature gate is disabled", func() {
+			clusterConfig := &cmdv1.ClusterConfig{
+				PCINUMAAwareTopologyEnabled: false,
+			}
+
+			options := &cmdv1.VirtualMachineOptions{
+				VirtualMachineSMBios: &cmdv1.SMBios{},
+				ClusterConfig:        clusterConfig,
+			}
+
+			libvirtManager := manager.(*LibvirtDomainManager)
+			converterContext, err := libvirtManager.generateConverterContext(vmi, true, options, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			Expect(converterContext.PCINUMAAwareTopologyEnabled).To(BeFalse())
+		})
+
+		It("should default PCINUMAAwareTopologyEnabled=false when cluster config is nil", func() {
+			options := &cmdv1.VirtualMachineOptions{
+				VirtualMachineSMBios: &cmdv1.SMBios{},
+				ClusterConfig:        nil,
+			}
+
+			libvirtManager := manager.(*LibvirtDomainManager)
+			converterContext, err := libvirtManager.generateConverterContext(vmi, true, options, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			Expect(converterContext.PCINUMAAwareTopologyEnabled).To(BeFalse())
+		})
+	})
+
+	Context("on GuestPing", func() {
+		const pingCmd = `{"execute":"guest-ping"}`
+
+		It("should succeed when guest-ping returns successfully", func() {
+			manager, _ := newLibvirtDomainManagerDefault()
+			mockLibvirt.ConnectionEXPECT().QemuAgentCommand(pingCmd, testDomainName).Return("", nil)
+			Expect(manager.GuestPing(testDomainName)).To(Succeed())
+		})
+
+		It("should return error when guest-ping fails and no migration is in progress", func() {
+			pingErr := fmt.Errorf("guest agent not responding")
+			manager, _ := newLibvirtDomainManagerDefault()
+			mockLibvirt.ConnectionEXPECT().QemuAgentCommand(pingCmd, testDomainName).Return("", pingErr)
+			Expect(manager.GuestPing(testDomainName)).To(MatchError(pingErr))
+		})
+
+		// GuestAgentPing is implemented as a Kubernetes exec probe running virt-probe
+		// inside the compute container. Kubelet therefore executes the probe on both
+		// the source and the target pods simultaneously throughout the migration.
+		//
+		// Pre-copy phase: source VM is still running (probe succeeds); target VM is
+		// paused receiving memory pages (probe fails → must be suppressed).
+		//
+		// Post-copy phase: target VM is now running (probe succeeds); source VM has
+		// been handed off and is in a ghost/paused state (probe fails → must be
+		// suppressed).
+		//
+		// Suppression is gated on the error being a guest-agent-unavailable libvirt
+		// error (ERR_AGENT_UNRESPONSIVE or ERR_NO_DOMAIN) so that unrelated libvirt
+		// or connection errors are still surfaced even during migration.
+
+		Context("in pre-copy migration phase", func() {
+			BeforeEach(func() {
+				now := metav1.Now()
+				metadataCache.Migration.Store(api.MigrationMetadata{
+					UID:            "test-migration-uid",
+					StartTimestamp: &now,
+					Mode:           v1.MigrationPreCopy,
+				})
+			})
+
+			It("should not suppress a passing probe on the source pod (VM is running and reachable)", func() {
+				manager, _ := newLibvirtDomainManagerDefault()
+				mockLibvirt.ConnectionEXPECT().QemuAgentCommand(pingCmd, testDomainName).Return("", nil)
+				Expect(manager.GuestPing(testDomainName)).To(Succeed())
+			})
+
+			It("should suppress ERR_AGENT_UNRESPONSIVE on the target pod (VM paused, receiving memory pages)", func() {
+				agentErr := libvirt.Error{Code: libvirt.ERR_AGENT_UNRESPONSIVE}
+				manager, _ := newLibvirtDomainManagerDefault()
+				mockLibvirt.ConnectionEXPECT().QemuAgentCommand(pingCmd, testDomainName).Return("", agentErr)
+				Expect(manager.GuestPing(testDomainName)).To(Succeed())
+			})
+
+			It("should suppress ERR_NO_DOMAIN on the target pod (domain not yet present)", func() {
+				manager, _ := newLibvirtDomainManagerDefault()
+				mockLibvirt.ConnectionEXPECT().QemuAgentCommand(pingCmd, testDomainName).Return("", libvirt.Error{Code: libvirt.ERR_NO_DOMAIN})
+				Expect(manager.GuestPing(testDomainName)).To(Succeed())
+			})
+
+			It("should still surface unrelated libvirt errors during migration", func() {
+				connErr := libvirt.Error{Code: libvirt.ERR_INTERNAL_ERROR}
+				manager, _ := newLibvirtDomainManagerDefault()
+				mockLibvirt.ConnectionEXPECT().QemuAgentCommand(pingCmd, testDomainName).Return("", connErr)
+				Expect(manager.GuestPing(testDomainName)).To(MatchError(connErr))
+			})
+		})
+
+		Context("in post-copy migration phase", func() {
+			BeforeEach(func() {
+				now := metav1.Now()
+				metadataCache.Migration.Store(api.MigrationMetadata{
+					UID:            "test-migration-uid",
+					StartTimestamp: &now,
+					Mode:           v1.MigrationPostCopy,
+				})
+			})
+
+			It("should not suppress a passing probe on the target pod (VM is running and reachable)", func() {
+				manager, _ := newLibvirtDomainManagerDefault()
+				mockLibvirt.ConnectionEXPECT().QemuAgentCommand(pingCmd, testDomainName).Return("", nil)
+				Expect(manager.GuestPing(testDomainName)).To(Succeed())
+			})
+
+			It("should suppress ERR_AGENT_UNRESPONSIVE on the source pod (VM handed off, no longer accessible)", func() {
+				agentErr := libvirt.Error{Code: libvirt.ERR_AGENT_UNRESPONSIVE}
+				manager, _ := newLibvirtDomainManagerDefault()
+				mockLibvirt.ConnectionEXPECT().QemuAgentCommand(pingCmd, testDomainName).Return("", agentErr)
+				Expect(manager.GuestPing(testDomainName)).To(Succeed())
+			})
+		})
+
+		It("should not suppress agent errors once the migration has completed", func() {
+			now := metav1.Now()
+			later := metav1.NewTime(now.Add(time.Second))
+			metadataCache.Migration.Store(api.MigrationMetadata{
+				UID:            "test-migration-uid",
+				StartTimestamp: &now,
+				EndTimestamp:   &later,
+			})
+			agentErr := libvirt.Error{Code: libvirt.ERR_AGENT_UNRESPONSIVE}
+			manager, _ := newLibvirtDomainManagerDefault()
+			mockLibvirt.ConnectionEXPECT().QemuAgentCommand(pingCmd, testDomainName).Return("", agentErr)
+			mockLibvirt.ConnectionEXPECT().LookupDomainByName(testDomainName).DoAndReturn(mockDomainWithFreeExpectation)
+			mockLibvirt.DomainEXPECT().GetState().Return(libvirt.DOMAIN_RUNNING, int(libvirt.DOMAIN_RUNNING_UNKNOWN), nil)
+			Expect(manager.GuestPing(testDomainName)).To(MatchError(agentErr))
+		})
+
+		// When no migration is in progress the probe suppression falls back to
+		// isPausedButHealthy: guest agent unavailability is expected whenever the
+		// domain is paused for an intentional/transient reason (user request,
+		// snapshot, save, …). It must NOT be suppressed when the domain is paused
+		// due to a fault (IO error, crash, postcopy failure).
+		Context("when the VM is paused but in a healthy state (no migration in progress)", func() {
+			var agentErr libvirt.Error
+
+			BeforeEach(func() {
+				agentErr = libvirt.Error{Code: libvirt.ERR_AGENT_UNRESPONSIVE}
+			})
+
+			DescribeTable("should suppress ERR_AGENT_UNRESPONSIVE for healthy pause reasons",
+				func(pauseReason libvirt.DomainPausedReason) {
+					manager, _ := newLibvirtDomainManagerDefault()
+					mockLibvirt.ConnectionEXPECT().QemuAgentCommand(pingCmd, testDomainName).Return("", agentErr)
+					mockLibvirt.ConnectionEXPECT().LookupDomainByName(testDomainName).DoAndReturn(mockDomainWithFreeExpectation)
+					mockLibvirt.DomainEXPECT().GetState().Return(libvirt.DOMAIN_PAUSED, int(pauseReason), nil)
+					Expect(manager.GuestPing(testDomainName)).To(Succeed())
+				},
+				Entry("paused by user", libvirt.DOMAIN_PAUSED_USER),
+				Entry("paused for migration (pre-copy source)", libvirt.DOMAIN_PAUSED_MIGRATION),
+				Entry("paused for save", libvirt.DOMAIN_PAUSED_SAVE),
+				Entry("paused for dump", libvirt.DOMAIN_PAUSED_DUMP),
+				Entry("paused from snapshot", libvirt.DOMAIN_PAUSED_FROM_SNAPSHOT),
+				Entry("paused while shutting down", libvirt.DOMAIN_PAUSED_SHUTTING_DOWN),
+				Entry("paused for snapshot", libvirt.DOMAIN_PAUSED_SNAPSHOT),
+				Entry("paused while starting up", libvirt.DOMAIN_PAUSED_STARTING_UP),
+				Entry("paused for postcopy migration", libvirt.DOMAIN_PAUSED_POSTCOPY),
+			)
+
+			DescribeTable("should not suppress ERR_AGENT_UNRESPONSIVE for unhealthy pause reasons",
+				func(pauseReason libvirt.DomainPausedReason) {
+					manager, _ := newLibvirtDomainManagerDefault()
+					mockLibvirt.ConnectionEXPECT().QemuAgentCommand(pingCmd, testDomainName).Return("", agentErr)
+					mockLibvirt.ConnectionEXPECT().LookupDomainByName(testDomainName).DoAndReturn(mockDomainWithFreeExpectation)
+					mockLibvirt.DomainEXPECT().GetState().Return(libvirt.DOMAIN_PAUSED, int(pauseReason), nil)
+					Expect(manager.GuestPing(testDomainName)).To(MatchError(agentErr))
+				},
+				Entry("paused due to IO error", libvirt.DOMAIN_PAUSED_IOERROR),
+				Entry("paused due to crash", libvirt.DOMAIN_PAUSED_CRASHED),
+				Entry("postcopy migration failed", libvirt.DOMAIN_PAUSED_POSTCOPY_FAILED),
+				Entry("unknown pause reason", libvirt.DOMAIN_PAUSED_UNKNOWN),
+			)
+
+			It("should not suppress ERR_AGENT_UNRESPONSIVE when the domain is running (not paused)", func() {
+				manager, _ := newLibvirtDomainManagerDefault()
+				mockLibvirt.ConnectionEXPECT().QemuAgentCommand(pingCmd, testDomainName).Return("", agentErr)
+				mockLibvirt.ConnectionEXPECT().LookupDomainByName(testDomainName).DoAndReturn(mockDomainWithFreeExpectation)
+				mockLibvirt.DomainEXPECT().GetState().Return(libvirt.DOMAIN_RUNNING, 0, nil)
+				Expect(manager.GuestPing(testDomainName)).To(MatchError(agentErr))
+			})
+
+			It("should suppress ERR_AGENT_UNRESPONSIVE when domain is not found (target pod before domain creation)", func() {
+				manager, _ := newLibvirtDomainManagerDefault()
+				mockLibvirt.ConnectionEXPECT().QemuAgentCommand(pingCmd, testDomainName).Return("", agentErr)
+				mockLibvirt.ConnectionEXPECT().LookupDomainByName(testDomainName).Return(nil, libvirt.Error{Code: libvirt.ERR_NO_DOMAIN})
+				Expect(manager.GuestPing(testDomainName)).To(Succeed())
+			})
+
+			It("should not suppress ERR_AGENT_UNRESPONSIVE when LookupDomainByName fails with an unrelated error", func() {
+				manager, _ := newLibvirtDomainManagerDefault()
+				mockLibvirt.ConnectionEXPECT().QemuAgentCommand(pingCmd, testDomainName).Return("", agentErr)
+				mockLibvirt.ConnectionEXPECT().LookupDomainByName(testDomainName).Return(nil, libvirt.Error{Code: libvirt.ERR_INTERNAL_ERROR})
+				Expect(manager.GuestPing(testDomainName)).To(MatchError(agentErr))
+			})
+
+			It("should suppress ERR_AGENT_UNRESPONSIVE when GetState fails (domain terminated during probe)", func() {
+				manager, _ := newLibvirtDomainManagerDefault()
+				mockLibvirt.ConnectionEXPECT().QemuAgentCommand(pingCmd, testDomainName).Return("", agentErr)
+				mockLibvirt.ConnectionEXPECT().LookupDomainByName(testDomainName).DoAndReturn(mockDomainWithFreeExpectation)
+				mockLibvirt.DomainEXPECT().GetState().Return(libvirt.DOMAIN_NOSTATE, 0, fmt.Errorf("domain gone"))
+				Expect(manager.GuestPing(testDomainName)).To(Succeed())
+			})
+		})
 	})
 
 	// TODO: test error reporting on non successful VirtualMachineInstance syncs and kill attempts
@@ -3409,6 +3717,44 @@ var _ = Describe("Manager helper functions", func() {
 
 	})
 
+	Context("isPVCBacked", func() {
+		It("should return true when volume has PersistentVolumeClaimInfo", func() {
+			vmi := &v1.VirtualMachineInstance{
+				Status: v1.VirtualMachineInstanceStatus{
+					VolumeStatus: []v1.VolumeStatus{
+						{
+							Name:                      "pvc-disk",
+							PersistentVolumeClaimInfo: &v1.PersistentVolumeClaimInfo{},
+						},
+					},
+				},
+			}
+			Expect(isPVCBacked("pvc-disk", vmi)).To(BeTrue())
+		})
+
+		It("should return false when volume has no PersistentVolumeClaimInfo", func() {
+			vmi := &v1.VirtualMachineInstance{
+				Status: v1.VirtualMachineInstanceStatus{
+					VolumeStatus: []v1.VolumeStatus{
+						{
+							Name: "containerdisk",
+						},
+					},
+				},
+			}
+			Expect(isPVCBacked("containerdisk", vmi)).To(BeFalse())
+		})
+
+		It("should return false when volume is not found", func() {
+			vmi := &v1.VirtualMachineInstance{
+				Status: v1.VirtualMachineInstanceStatus{
+					VolumeStatus: []v1.VolumeStatus{},
+				},
+			}
+			Expect(isPVCBacked("nonexistent", vmi)).To(BeFalse())
+		})
+	})
+
 	Context("possibleGuestSize", func() {
 
 		var properDisk api.Disk
@@ -3425,21 +3771,68 @@ var _ = Describe("Manager helper functions", func() {
 			}
 		})
 
-		It("should return correct value", func() {
-			size, ok := possibleGuestSize(properDisk)
+		It("should return correct value for file backed disk", func() {
+			ds := disksource.Resolve(properDisk)
+			size, ok := possibleGuestSize(properDisk, ds)
 			Expect(ok).To(BeTrue())
-			capacity := properDisk.Capacity
-			Expect(capacity).ToNot(BeNil())
 
-			expectedSize := int64((1 - fakePercentFloat) * float64(*capacity))
-			// The size is expected to be 1MiB-aligned
+			expectedSize := int64((1 - fakePercentFloat) * float64(*properDisk.Capacity))
 			expectedSize = expectedSize - expectedSize%(1024*1024)
-
 			Expect(size).To(Equal(expectedSize))
 		})
 
-		DescribeTable("should return error when", func(createDisk func() api.Disk) {
-			_, ok := possibleGuestSize(createDisk())
+		It("should return (0, true) for a direct block device", func() {
+			disk := api.Disk{Source: api.DiskSource{Dev: "/dev/vda"}}
+			ds := disksource.Resolve(disk)
+			size, ok := possibleGuestSize(disk, ds)
+			Expect(ok).To(BeTrue())
+			Expect(size).To(Equal(int64(0)))
+		})
+
+		It("should return (0, false) for a datastore backed block device with unreachable backend", func() {
+			disk := api.Disk{
+				Source: api.DiskSource{
+					File: "/test/overlay.qcow2",
+					DataStore: &api.DataStore{
+						Type:   "block",
+						Source: &api.DiskSource{Dev: "/dev/nonexistent"},
+					},
+				},
+			}
+			ds := disksource.Resolve(disk)
+			_, ok := possibleGuestSize(disk, ds)
+			Expect(ok).To(BeFalse())
+		})
+
+		It("should apply filesystem overhead for datastore backed file", func() {
+			fakePercentFloat := 0.05
+			fakePercent := v1.Percent(fmt.Sprint(fakePercentFloat))
+			fakeCapacity := int64(100 * 1024 * 1024)
+			disk := api.Disk{
+				FilesystemOverhead: &fakePercent,
+				Capacity:           &fakeCapacity,
+				Source: api.DiskSource{
+					File: "/test/overlay.qcow2",
+					DataStore: &api.DataStore{
+						Type:   "file",
+						Source: &api.DiskSource{File: "/test/disk.img"},
+					},
+				},
+			}
+			ds := disksource.Resolve(disk)
+			Expect(ds.BackendIsBlock()).To(BeFalse())
+			Expect(ds.HasOverlay()).To(BeTrue())
+			size, ok := possibleGuestSize(disk, ds)
+			Expect(ok).To(BeTrue())
+			expectedSize := int64((1 - fakePercentFloat) * float64(fakeCapacity))
+			expectedSize = expectedSize - expectedSize%(1024*1024)
+			Expect(size).To(Equal(expectedSize))
+		})
+
+		DescribeTable("should not be ok when", func(createDisk func() api.Disk) {
+			disk := createDisk()
+			ds := disksource.Resolve(disk)
+			_, ok := possibleGuestSize(disk, ds)
 			Expect(ok).To(BeFalse())
 		},
 			Entry("disk capacity is nil", func() api.Disk {
@@ -3464,8 +3857,18 @@ var _ = Describe("Manager helper functions", func() {
 				disk.FilesystemOverhead = &fakePercent
 				return disk
 			}),
+			Entry("dataStore backed block device with unreachable backend", func() api.Disk {
+				return api.Disk{
+					Source: api.DiskSource{
+						File: "/test/overlay.qcow2",
+						DataStore: &api.DataStore{
+							Type:   "block",
+							Source: &api.DiskSource{Dev: "/dev/nonexistent"},
+						},
+					},
+				}
+			}),
 		)
-
 	})
 
 	Context("configureLocalDiskToMigrate", func() {
@@ -3635,7 +4038,211 @@ var _ = Describe("Manager helper functions", func() {
 	})
 })
 
-var _ = Describe("calculateHotplugPortCount", func() {
+var _ = Describe("calculateHotplugPortCountV1", func() {
+	It("should return 0 when PlacePCIDevicesOnRootComplex is true", func() {
+		vmi := newVMI("testns", "kubevirt")
+		vmi.Annotations = map[string]string{
+			v1.PlacePCIDevicesOnRootComplex: "true",
+		}
+		vmi.Spec.Domain.Devices.Interfaces = []v1.Interface{{Name: "default"}}
+
+		Expect(calculateHotplugPortCountV1(vmi)).To(Equal(0))
+	})
+
+	It("should return 0 when there are no interfaces", func() {
+		vmi := newVMI("testns", "kubevirt")
+		vmi.Spec.Domain.Devices.Interfaces = nil
+
+		Expect(calculateHotplugPortCountV1(vmi)).To(Equal(0))
+	})
+
+	DescribeTable("should return the correct port count based on interface count",
+		func(interfaceCount, expectedResult int) {
+			vmi := newVMI("testns", "kubevirt")
+			for i := 0; i < interfaceCount; i++ {
+				vmi.Spec.Domain.Devices.Interfaces = append(vmi.Spec.Domain.Devices.Interfaces,
+					v1.Interface{Name: fmt.Sprintf("iface%d", i)})
+			}
+			Expect(calculateHotplugPortCountV1(vmi)).To(Equal(expectedResult))
+		},
+		Entry("with 1 interface", 1, 3),
+		Entry("with 2 interfaces", 2, 2),
+		Entry("with 3 interfaces", 3, 1),
+		Entry("with 4 interfaces", 4, 0),
+		Entry("with 5 interfaces", 5, 0),
+	)
+})
+
+var _ = Describe("calculatePlaceholderCount", func() {
+	It("should derive placeholders from frozen slot total when present", func() {
+		vmi := newVMI("testns", "kubevirt")
+		vmi.Spec.Domain.Devices.Interfaces = []v1.Interface{{Name: "default"}}
+		vmi.Annotations = map[string]string{
+			v1.PciInterfaceSlotCountAnnotation: "11",
+		}
+		count, err := calculatePlaceholderCount(vmi)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(count).To(Equal(10)) // max(0, 11-1) = 10
+	})
+
+	It("should clamp to zero when interfaces exceed slot total", func() {
+		vmi := newVMI("testns", "kubevirt")
+		vmi.Spec.Domain.Devices.Interfaces = []v1.Interface{
+			{Name: "iface1"}, {Name: "iface2"}, {Name: "iface3"},
+		}
+		vmi.Annotations = map[string]string{
+			v1.PciInterfaceSlotCountAnnotation: "2",
+		}
+		count, err := calculatePlaceholderCount(vmi)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(count).To(Equal(0)) // max(0, 2-3) = 0
+	})
+
+	It("should return error for invalid annotation value", func() {
+		vmi := newVMI("testns", "kubevirt")
+		vmi.Annotations = map[string]string{
+			v1.PciInterfaceSlotCountAnnotation: "not-a-number",
+		}
+		_, err := calculatePlaceholderCount(vmi)
+		Expect(err).To(HaveOccurred())
+	})
+
+	It("should fall back to v1 formula when annotation is absent", func() {
+		vmi := newVMI("testns", "kubevirt")
+		vmi.Spec.Domain.Devices.Interfaces = []v1.Interface{{Name: "default"}}
+		count, err := calculatePlaceholderCount(vmi)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(count).To(Equal(3)) // v1: max(0, 4-1) = 3
+	})
+})
+
+var _ = Describe("calculateExtraControllerCount", func() {
+	const gb = 1024 * 1024 * 1024
+
+	domainWithDevices := func(num int) *api.DomainSpec {
+		dom := &api.DomainSpec{}
+		for i := 0; i < num; i++ {
+			dom.Devices.Disks = append(dom.Devices.Disks, api.Disk{
+				Target: api.DiskTarget{
+					Bus: v1.DiskBusVirtio,
+				},
+			})
+		}
+		return dom
+	}
+
+	It("should return 0 when PlacePCIDevicesOnRootComplex is true", func() {
+		vmi := newVMI("testns", "kubevirt")
+		vmi.Annotations = map[string]string{
+			v1.PlacePCIDevicesOnRootComplex: "true",
+		}
+		count, err := calculateExtraControllerCount(vmi, nil, 3)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(count).To(Equal(0))
+	})
+
+	DescribeTable("should return extra controllers beyond placeholder count",
+		func(mem uint64, portsInUse, placeholderCount, expectedResult int) {
+			vmi := newVMI("testns", "kubevirt")
+			domainSpec := domainWithDevices(portsInUse)
+			domainSpec.Memory.Value = mem
+			count, err := calculateExtraControllerCount(vmi, domainSpec, placeholderCount)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(count).To(Equal(expectedResult))
+		},
+		// >2GB: v2 wants 16 total, 6 min free
+		Entry(">2G, 4 devices, 3 placeholders", uint64(3*gb), 4, 3, 9),   // v2=12, 12-3=9
+		Entry(">2G, 10 devices, 3 placeholders", uint64(3*gb), 10, 3, 3), // v2=6, 6-3=3
+		Entry(">2G, 4 devices, 0 placeholders", uint64(3*gb), 4, 0, 12),  // v2=12, 12-0=12
+		// <=2GB: v2 wants 8 total, 3 min free
+		Entry("1G, 2 devices, 3 placeholders", uint64(1*gb), 2, 3, 3), // v2=6, 6-3=3
+		Entry("1G, 5 devices, 3 placeholders", uint64(1*gb), 5, 3, 0), // v2=3, 3-3=0
+		Entry("1G, 2 devices, 0 placeholders", uint64(1*gb), 2, 0, 6), // v2=6, 6-0=6
+		Entry("2G, 4 devices, 2 placeholders", uint64(2*gb), 4, 2, 2), // v2=4, 4-2=2
+		// Placeholder count exceeds v2 desired (shouldn't happen, but handle gracefully)
+		Entry("1G, 7 devices, 3 placeholders", uint64(1*gb), 7, 3, 0), // v2=3, max(0, 3-3)=0
+	)
+})
+
+var _ = Describe("appendPCIeRootPortControllers", func() {
+	It("should append controllers with correct indices", func() {
+		domainSpec := &api.DomainSpec{}
+		domainSpec.Devices.Controllers = []api.Controller{
+			{Type: "pci", Index: "0", Model: "pcie-root"},
+			{Type: "pci", Index: "1", Model: "pcie-root-port"},
+			{Type: "pci", Index: "2", Model: "pcie-root-port"},
+			{Type: "usb", Index: "0", Model: "qemu-xhci"},
+		}
+
+		appendPCIeRootPortControllers(domainSpec, 3)
+
+		Expect(domainSpec.Devices.Controllers).To(HaveLen(7))
+		Expect(domainSpec.Devices.Controllers[4]).To(Equal(api.Controller{
+			Type: "pci", Index: "3", Model: "pcie-root-port",
+		}))
+		Expect(domainSpec.Devices.Controllers[5]).To(Equal(api.Controller{
+			Type: "pci", Index: "4", Model: "pcie-root-port",
+		}))
+		Expect(domainSpec.Devices.Controllers[6]).To(Equal(api.Controller{
+			Type: "pci", Index: "5", Model: "pcie-root-port",
+		}))
+	})
+
+	It("should handle empty controller list", func() {
+		domainSpec := &api.DomainSpec{}
+		appendPCIeRootPortControllers(domainSpec, 2)
+
+		Expect(domainSpec.Devices.Controllers).To(HaveLen(2))
+		Expect(domainSpec.Devices.Controllers[0].Index).To(Equal("1"))
+		Expect(domainSpec.Devices.Controllers[1].Index).To(Equal("2"))
+	})
+
+	It("should cap at bus 0 slot limit", func() {
+		domainSpec := &api.DomainSpec{}
+		// Existing controllers up to index 29
+		for i := 0; i <= 29; i++ {
+			domainSpec.Devices.Controllers = append(domainSpec.Devices.Controllers, api.Controller{
+				Type: "pci", Index: fmt.Sprintf("%d", i), Model: "pcie-root-port",
+			})
+		}
+		// Request 5 more, but only 2 should fit (indices 30 and 31)
+		appendPCIeRootPortControllers(domainSpec, 5)
+
+		Expect(domainSpec.Devices.Controllers).To(HaveLen(32))
+		Expect(domainSpec.Devices.Controllers[30].Index).To(Equal("30"))
+		Expect(domainSpec.Devices.Controllers[31].Index).To(Equal("31"))
+	})
+})
+
+var _ = Describe("maxPCIControllerIndex", func() {
+	It("should return 0 when no controllers exist", func() {
+		domainSpec := &api.DomainSpec{}
+		Expect(maxPCIControllerIndex(domainSpec)).To(Equal(0))
+	})
+
+	It("should ignore non-PCI controllers", func() {
+		domainSpec := &api.DomainSpec{}
+		domainSpec.Devices.Controllers = []api.Controller{
+			{Type: "usb", Index: "0"},
+			{Type: "scsi", Index: "5"},
+		}
+		Expect(maxPCIControllerIndex(domainSpec)).To(Equal(0))
+	})
+
+	It("should find the highest PCI controller index", func() {
+		domainSpec := &api.DomainSpec{}
+		domainSpec.Devices.Controllers = []api.Controller{
+			{Type: "pci", Index: "0", Model: "pcie-root"},
+			{Type: "pci", Index: "3", Model: "pcie-root-port"},
+			{Type: "usb", Index: "0"},
+			{Type: "pci", Index: "7", Model: "pcie-root-port"},
+			{Type: "pci", Index: "1", Model: "pcie-root-port"},
+		}
+		Expect(maxPCIControllerIndex(domainSpec)).To(Equal(7))
+	})
+})
+
+var _ = Describe("calculateHotplugPortCountV2", func() {
 	const gb = 1024 * 1024 * 1024
 
 	domainWithDevices := func(num int) *api.DomainSpec {
@@ -3656,7 +4263,7 @@ var _ = Describe("calculateHotplugPortCount", func() {
 			v1.PlacePCIDevicesOnRootComplex: "true",
 		}
 
-		count, err := calculateHotplugPortCount(vmi, nil)
+		count, err := calculateHotplugPortCountV2(vmi, nil)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(count).To(Equal(0))
 	})
@@ -3665,7 +4272,7 @@ var _ = Describe("calculateHotplugPortCount", func() {
 		vmi := newVMI("testns", "kubevirt")
 		domainSpec := domainWithDevices(portsInUse)
 		domainSpec.Memory.Value = mem
-		count, err := calculateHotplugPortCount(vmi, domainSpec)
+		count, err := calculateHotplugPortCountV2(vmi, domainSpec)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(count).To(Equal(expectedResult))
 	},
@@ -3686,6 +4293,128 @@ var _ = Describe("calculateHotplugPortCount", func() {
 		Entry("with 3G memory and 12 ports in use", uint64(3*gb), 12, 6),
 		Entry("with 3G memory and 16 ports in use", uint64(3*gb), 16, 6),
 	)
+})
+
+var _ = Describe("shouldExpandOnline", func() {
+	var (
+		ctrl        *gomock.Controller
+		mockLibvirt *testing.Libvirt
+	)
+
+	const (
+		gb          = 1024 * 1024 * 1024
+		fakePercent = v1.Percent("0.05")
+	)
+
+	BeforeEach(func() {
+		ctrl = gomock.NewController(GinkgoT())
+		mockLibvirt = testing.NewLibvirt(ctrl)
+	})
+
+	DescribeTable("should determine expansion correctly",
+		func(disk api.Disk, blockInfo *libvirt.DomainBlockInfo, expectExpand bool, sizeMatcher OmegaMatcher) {
+			ds := disksource.Resolve(disk)
+			mockLibvirt.DomainEXPECT().GetBlockInfo(ds.SourcePath(), gomock.Any()).Return(blockInfo, nil)
+			expand, size := shouldExpandOnline(mockLibvirt.VirtDomain, disk, ds)
+			Expect(expand).To(Equal(expectExpand))
+			Expect(size).To(sizeMatcher)
+		},
+		Entry("not expand when capacity is 0",
+			api.Disk{
+				Source: api.DiskSource{File: "/disks/disk.img"},
+				Alias:  api.NewUserDefinedAlias("test-disk"),
+			},
+			&libvirt.DomainBlockInfo{Capacity: 0},
+			false, Equal(int64(0)),
+		),
+		Entry("expand for direct block device where capacity < physical",
+			api.Disk{
+				Source: api.DiskSource{Dev: "/dev/vda"},
+				Alias:  api.NewUserDefinedAlias("test-disk"),
+			},
+			&libvirt.DomainBlockInfo{Capacity: gb, Physical: 2 * gb},
+			true, Equal(int64(0)),
+		),
+		Entry("not expand for direct block device where capacity >= physical",
+			api.Disk{
+				Source: api.DiskSource{Dev: "/dev/vda"},
+				Alias:  api.NewUserDefinedAlias("test-disk"),
+			},
+			&libvirt.DomainBlockInfo{Capacity: 2 * gb, Physical: 2 * gb},
+			false, Equal(int64(0)),
+		),
+		Entry("not expand for datastore block device where capacity >= physical",
+			api.Disk{
+				Source: api.DiskSource{
+					File:      "/test/overlay.qcow2",
+					DataStore: &api.DataStore{Type: "block", Source: &api.DiskSource{Dev: "/dev/vda"}},
+				},
+				Alias: api.NewUserDefinedAlias("test-disk"),
+			},
+			&libvirt.DomainBlockInfo{Capacity: 2 * gb, Physical: 2 * gb},
+			false, Equal(int64(0)),
+		),
+		Entry("expand for fie backed disk where possibleGuestSize > capacity",
+			api.Disk{
+				FilesystemOverhead: virtpointer.P(fakePercent),
+				Capacity:           virtpointer.P(int64(2 * gb)),
+				Source:             api.DiskSource{File: "/disks/disk.img"},
+				Alias:              api.NewUserDefinedAlias("test-disk"),
+			},
+			&libvirt.DomainBlockInfo{Capacity: gb},
+			true, BeNumerically(">", 0),
+		),
+		Entry("not expand for file backed disk where possibleGuestSize <= capacity",
+			api.Disk{
+				FilesystemOverhead: virtpointer.P(fakePercent),
+				Capacity:           virtpointer.P(int64(gb)),
+				Source:             api.DiskSource{File: "/disks/disk.img"},
+				Alias:              api.NewUserDefinedAlias("test-disk"),
+			},
+			&libvirt.DomainBlockInfo{Capacity: 2 * gb},
+			false, Equal(int64(0)),
+		),
+		Entry("not expand for datastore block device when backend is unreachable",
+			api.Disk{
+				Source: api.DiskSource{
+					File:      "/test/overlay.qcow2",
+					DataStore: &api.DataStore{Type: "block", Source: &api.DiskSource{Dev: "/dev/vda"}},
+				},
+				Alias: api.NewUserDefinedAlias("test-disk"),
+			},
+			&libvirt.DomainBlockInfo{Capacity: gb, Physical: 2 * gb},
+			false, Equal(int64(0)),
+		),
+	)
+})
+
+var _ = Describe("shouldExpandOffline", func() {
+	It("should return false for a direct block device", func() {
+		disk := api.Disk{
+			Source: api.DiskSource{
+				Dev: "/dev/vda",
+			},
+		}
+		Expect(shouldExpandOffline(disk)).To(BeFalse())
+	})
+
+	It("should return false for a datastore backed block device", func() {
+		disk := api.Disk{
+			Source: api.DiskSource{
+				File: "/test/overlay.qcow2",
+				DataStore: &api.DataStore{
+					Type: "block",
+					Format: &api.DataStoreFormat{
+						Type: "raw",
+					},
+					Source: &api.DiskSource{
+						Dev: "/dev/vda",
+					},
+				},
+			},
+		}
+		Expect(shouldExpandOffline(disk)).To(BeFalse())
+	})
 })
 
 func newVMI(namespace, name string) *v1.VirtualMachineInstance {

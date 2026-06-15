@@ -332,6 +332,45 @@ spec:
           - watch
           - patch
         - apiGroups:
+          - template.kubevirt.io
+          resources:
+          - virtualmachinetemplates
+          - virtualmachinetemplaterequests
+          verbs:
+          - create
+          - delete
+          - deletecollection
+          - get
+          - list
+          - patch
+          - update
+          - watch
+        - apiGroups:
+          - template.kubevirt.io
+          resources:
+          - virtualmachinetemplates/status
+          - virtualmachinetemplaterequests/status
+          verbs:
+          - get
+          - patch
+        - apiGroups:
+          - template.kubevirt.io
+          resources:
+          - virtualmachinetemplates/finalizers
+          - virtualmachinetemplaterequests/finalizers
+          verbs:
+          - update
+        - apiGroups:
+          - template.kubevirt.io
+          resources:
+          - virtualmachinetemplaterequests/source
+          verbs:
+          - create
+        - nonResourceURLs:
+          - /metrics
+          verbs:
+          - get
+        - apiGroups:
           - ""
           resources:
           - pods
@@ -689,6 +728,7 @@ spec:
           - virtualmachineinstances/addvolume
           - virtualmachineinstances/removevolume
           - virtualmachineinstances/backup
+          - virtualmachineinstances/redefine-checkpoint
           - virtualmachineinstances/freeze
           - virtualmachineinstances/unfreeze
           - virtualmachineinstances/reset
@@ -703,12 +743,6 @@ spec:
           - '*'
           verbs:
           - '*'
-        - apiGroups:
-          - k8s.cni.cncf.io
-          resources:
-          - network-attachment-definitions
-          verbs:
-          - get
         - apiGroups:
           - apiextensions.k8s.io
           resources:
@@ -813,11 +847,18 @@ spec:
           - watch
           - get
         - apiGroups:
+          - k8s.cni.cncf.io
+          resources:
+          - network-attachment-definitions
+          verbs:
+          - get
+        - apiGroups:
           - kubevirt.io
           resources:
           - virtualmachineinstances
           verbs:
           - update
+          - patch
           - list
           - watch
         - apiGroups:
@@ -868,6 +909,21 @@ spec:
           - get
           - list
           - watch
+        - apiGroups:
+          - backup.kubevirt.io
+          resources:
+          - virtualmachinebackuptrackers
+          - virtualmachinebackuptrackers/status
+          verbs:
+          - list
+          - watch
+          - patch
+        - apiGroups:
+          - apps
+          resources:
+          - controllerrevisions
+          verbs:
+          - get
         - apiGroups:
           - export.kubevirt.io
           resources:
@@ -1043,6 +1099,7 @@ spec:
           - backup.kubevirt.io
           resources:
           - virtualmachinebackups
+          - virtualmachinebackuptrackers
           verbs:
           - get
           - delete
@@ -1052,18 +1109,6 @@ spec:
           - list
           - watch
           - deletecollection
-        - apiGroups:
-          - backup.kubevirt.io
-          resources:
-          - virtualmachinebackuptrackers
-          - virtualmachinebackuptrackers/status
-          verbs:
-          - get
-          - list
-          - watch
-          - create
-          - update
-          - patch
         - apiGroups:
           - export.kubevirt.io
           resources:
@@ -1132,7 +1177,6 @@ spec:
           resources:
           - virtualmachineinstances/console
           - virtualmachineinstances/vnc
-          - virtualmachineinstances/vnc/screenshot
           - virtualmachineinstances/portforward
           - virtualmachineinstances/guestosinfo
           - virtualmachineinstances/filesystemlist
@@ -1226,6 +1270,7 @@ spec:
           - backup.kubevirt.io
           resources:
           - virtualmachinebackups
+          - virtualmachinebackuptrackers
           verbs:
           - get
           - delete
@@ -1352,6 +1397,7 @@ spec:
           - backup.kubevirt.io
           resources:
           - virtualmachinebackups
+          - virtualmachinebackuptrackers
           verbs:
           - get
           - list
@@ -1577,6 +1623,7 @@ spec:
           resourceNames:
           - kubevirt-ca
           - kubevirt-export-ca
+          - kubevirt-backup-ca
           - kubevirt-virt-handler-certs
           - kubevirt-virt-handler-server-certs
           - kubevirt-virt-handler-migration-client-certs
@@ -1587,6 +1634,9 @@ spec:
           - kubevirt-exportproxy-certs
           - kubevirt-synchronization-controller-certs
           - kubevirt-synchronization-controller-server-certs
+          - kubevirt-virt-template-api-certs
+          - kubevirt-virt-template-webhook-certs
+          - kubevirt-virt-template-controller-metrics-certs
           resources:
           - secrets
           verbs:

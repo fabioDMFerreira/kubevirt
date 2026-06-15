@@ -43,6 +43,7 @@ import (
 	cmdv1 "kubevirt.io/kubevirt/pkg/handler-launcher-com/cmd/v1"
 	"kubevirt.io/kubevirt/pkg/hooks"
 	"kubevirt.io/kubevirt/pkg/pointer"
+	"kubevirt.io/kubevirt/pkg/storage/cbt"
 	"kubevirt.io/kubevirt/pkg/util"
 	"kubevirt.io/kubevirt/pkg/util/net/ip"
 	migrationproxy "kubevirt.io/kubevirt/pkg/virt-handler/migration-proxy"
@@ -50,6 +51,7 @@ import (
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/api"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/cli"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/converter"
+	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/storage"
 )
 
 const (
@@ -179,6 +181,12 @@ func (l *LibvirtDomainManager) prepareMigrationTarget(
 		return fmt.Errorf("Failed to generate libvirt domain from VMI spec: %v", err)
 	}
 
+	if cbt.HasCBTStateEnabled(vmi.Status.ChangedBlockTracking) {
+		if err := storage.ApplyChangedBlockTrackingForMigration(vmi, c); err != nil {
+			return fmt.Errorf("failed to create CBT overlays for migration: %v", err)
+		}
+	}
+
 	domain := &api.Domain{}
 	if err := converter.Convert_v1_VirtualMachineInstance_To_api_Domain(vmi, domain, c); err != nil {
 		return fmt.Errorf("conversion failed: %v", err)
@@ -193,12 +201,10 @@ func (l *LibvirtDomainManager) prepareMigrationTarget(
 	l.metadataCache.GracePeriod.Set(
 		api.GracePeriodMetadata{DeletionGracePeriodSeconds: converter.GracePeriodSeconds(vmi)},
 	)
-	inProgress, err := l.initializeMigrationMetadata(vmi, v1.MigrationPreCopy)
-	if err != nil {
+	// inProgress is intentionally ignored: unlike the source side, target
+	// preparation must fully re-run on retries (sockets, hooks, etc.).
+	if _, err := l.initializeMigrationMetadata(vmi, v1.MigrationPreCopy); err != nil {
 		return err
-	}
-	if inProgress {
-		return nil
 	}
 
 	err = l.generateCloudInitEmptyISO(vmi, nil)

@@ -124,6 +124,8 @@ func AdjustKubeVirtResource() {
 		featuregate.VideoConfig,
 		featuregate.UtilityVolumesGate,
 		featuregate.MigrationPriorityQueue,
+		featuregate.RebootPolicy,
+		featuregate.ContainerPathVolumesGate,
 	)
 	kv.Spec.Configuration.ChangedBlockTrackingLabelSelectors = &v1.ChangedBlockTrackingSelectors{
 		VirtualMachineLabelSelector: &metav1.LabelSelector{

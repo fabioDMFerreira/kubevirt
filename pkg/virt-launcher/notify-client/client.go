@@ -275,9 +275,55 @@ func (e eventNotifier) UpdateEvents(event watch.Event) {
 	e.client.updateEvents(event, e.domain, e.events)
 }
 
+func isGuestPanicEvent(event *libvirt.DomainEventLifecycle) bool {
+	return event != nil && event.Event == libvirt.DOMAIN_EVENT_CRASHED
+}
+
+func (e *eventCaller) handleGuestPanicEvent(client *Notifier, vmi *v1.VirtualMachineInstance, metadataCache *metadata.Cache, eventDetail int, nonRoot bool) {
+	if vmi == nil {
+		log.Log.Warning("Guest panic detected but VMI is nil, cannot emit K8s event")
+		return
+	}
+
+	// Check if we already handled this panic event
+	if handled, exists := metadataCache.GuestPanicHandled.Load(); exists && handled {
+		log.Log.V(3).Info("Guest panic event already handled, skipping")
+		return
+	}
+
+	domainName := util.DomainFromNamespaceName(vmi.Namespace, vmi.Name)
+	logPath := util.GetQemuLogPath(domainName, nonRoot)
+
+	panicInfo, err := util.ReadPanicInfoFromLog(logPath)
+
+	var eventMessage string
+	if err != nil {
+		log.Log.Reason(err).Warning("Failed to read panic info from log")
+		eventMessage = "GuestPanicked (details unavailable)"
+	} else {
+		eventMessage = util.FormatGuestPanicInfo(panicInfo)
+		log.Log.Infof("Guest panic detected: %s", eventMessage)
+	}
+
+	// Only mark as handled for PANICKED events. CRASHLOADED indicates kdump-based
+	// recovery where the guest reboots, so subsequent panic events should still fire.
+	if libvirt.DomainEventCrashedDetailType(eventDetail) == libvirt.DOMAIN_EVENT_CRASHED_PANICKED {
+		metadataCache.GuestPanicHandled.Set(true)
+	}
+
+	if err := client.SendK8sEvent(vmi, k8sv1.EventTypeWarning, "GuestPanicked",
+		eventMessage); err != nil {
+		log.Log.Reason(err).Warningf("Failed to send guest panic event")
+	}
+}
+
 func (e *eventCaller) eventCallback(c cli.Connection, domain *api.Domain, libvirtEvent libvirtEvent, client *Notifier, events chan watch.Event,
 	interfaceStatus []api.InterfaceStatus, osInfo *api.GuestOSInfo, vmi *v1.VirtualMachineInstance, fsFreezeStatus *api.FSFreeze,
-	metadataCache *metadata.Cache) {
+	metadataCache *metadata.Cache, nonRoot bool) {
+	// Handle guest panic event early, before domain lookup which may fail if VM is already gone
+	if isGuestPanicEvent(libvirtEvent.Event) {
+		e.handleGuestPanicEvent(client, vmi, metadataCache, libvirtEvent.Event.Detail, nonRoot)
+	}
 
 	d, err := c.LookupDomainByName(util.DomainFromNamespaceName(domain.ObjectMeta.Namespace, domain.ObjectMeta.Name))
 	if err != nil {
@@ -324,13 +370,12 @@ func (e *eventCaller) eventCallback(c cli.Connection, domain *api.Domain, libvir
 		e.updateStatus(&domain.Status)
 	}
 
+	eventType := watch.Modified
+
 	switch domain.Status.Reason {
 	case api.ReasonNonExistent:
 		now := metav1.Now()
 		domain.ObjectMeta.DeletionTimestamp = &now
-		watchEvent := watch.Event{Type: watch.Modified, Object: domain}
-		client.SendDomainEvent(watchEvent)
-		client.updateEvents(watchEvent, domain, events)
 	case api.ReasonPausedIOError:
 		domainDisksWithErrors, err := d.GetDiskErrors(0)
 		if err != nil {
@@ -351,33 +396,37 @@ func (e *eventCaller) eventCallback(c cli.Connection, domain *api.Domain, libvir
 			if err != nil {
 				log.Log.Reason(err).Error(fmt.Sprintf("Could not send k8s event"))
 			}
-			event := watch.Event{Type: watch.Modified, Object: domain}
-			client.SendDomainEvent(event)
-			client.updateEvents(event, domain, events)
-		}
-	default:
-		switch {
-		case libvirtEvent.JobCompletedEvent != nil:
-			processJobCompletedEvent(client, domain, d, libvirtEvent.JobCompletedEvent, metadataCache, events)
-		case libvirtEvent.Event != nil:
-			processLifecycleEvent(client, domain, libvirtEvent.Event, metadataCache, events, c, vmi)
-		}
-		if interfaceStatus != nil {
-			domain.Status.Interfaces = interfaceStatus
-		}
-		if osInfo != nil {
-			domain.Status.OSInfo = *osInfo
-		}
-
-		if fsFreezeStatus != nil {
-			domain.Status.FSFreezeStatus = *fsFreezeStatus
-		}
-
-		err := client.SendDomainEvent(watch.Event{Type: watch.Modified, Object: domain})
-		if err != nil {
-			log.Log.Reason(err).Error("Could not send domain notify event.")
 		}
 	}
+
+	switch {
+	case libvirtEvent.JobCompletedEvent != nil:
+		if shouldAdd := processJobCompletedEvent(domain, d, libvirtEvent.JobCompletedEvent, metadataCache); shouldAdd {
+			eventType = watch.Added
+		}
+	case libvirtEvent.Event != nil:
+		if shouldAdd := processLifecycleEvent(client, domain, libvirtEvent.Event, metadataCache, events, c, vmi); shouldAdd {
+			eventType = watch.Added
+		}
+	}
+
+	if interfaceStatus != nil {
+		domain.Status.Interfaces = interfaceStatus
+	}
+	if osInfo != nil {
+		domain.Status.OSInfo = *osInfo
+	}
+
+	if fsFreezeStatus != nil {
+		domain.Status.FSFreezeStatus = *fsFreezeStatus
+	}
+
+	event := watch.Event{Type: eventType, Object: domain}
+
+	if err := client.SendDomainEvent(event); err != nil {
+		log.Log.Reason(err).Error("Could not send domain notify event.")
+	}
+	client.updateEvents(event, domain, events)
 }
 
 func (n *Notifier) StartDomainNotifier(
@@ -392,6 +441,7 @@ func (n *Notifier) StartDomainNotifier(
 	qemuAgentVersionInterval time.Duration,
 	qemuAgentFSFreezeStatusInterval time.Duration,
 	metadataCache *metadata.Cache,
+	nonRoot bool,
 ) error {
 
 	eventChan := make(chan libvirtEvent, 10)
@@ -426,7 +476,7 @@ func (n *Notifier) StartDomainNotifier(
 			case event := <-eventChan:
 				metadataCache.ResetNotification()
 				domainCache = util.NewDomainFromName(event.Domain, vmi.UID)
-				eventCaller.eventCallback(domainConn, domainCache, event, n, deleteNotificationSent, interfaceStatuses, guestOsInfo, vmi, fsFreezeStatus, metadataCache)
+				eventCaller.eventCallback(domainConn, domainCache, event, n, deleteNotificationSent, interfaceStatuses, guestOsInfo, vmi, fsFreezeStatus, metadataCache, nonRoot)
 				log.Log.Infof("Domain name event: %v", domainCache.Spec.Name)
 				agentPoller.UpdateFromEvent(event.Event, event.AgentEvent)
 			case agentUpdate := <-agentStore.AgentUpdated:
@@ -436,7 +486,7 @@ func (n *Notifier) StartDomainNotifier(
 				fsFreezeStatus = agentUpdate.DomainInfo.FSFreezeStatus
 
 				eventCaller.eventCallback(domainConn, domainCache, libvirtEvent{}, n, deleteNotificationSent,
-					interfaceStatuses, guestOsInfo, vmi, fsFreezeStatus, metadataCache)
+					interfaceStatuses, guestOsInfo, vmi, fsFreezeStatus, metadataCache, nonRoot)
 			case <-reconnectChan:
 				n.SendDomainEvent(newWatchEventError(fmt.Errorf("Libvirt reconnect, domain %s", domainName)))
 
@@ -459,6 +509,7 @@ func (n *Notifier) StartDomainNotifier(
 						vmi,
 						fsFreezeStatus,
 						metadataCache,
+						nonRoot,
 					)
 				}
 			}
@@ -650,34 +701,29 @@ func (n *Notifier) Close() {
 
 }
 
-func processJobCompletedEvent(client *Notifier, domain *api.Domain, d cli.VirDomain, jobCompletedEvent *libvirt.DomainEventJobCompleted, metadataCache *metadata.Cache, events chan watch.Event) {
+func processJobCompletedEvent(domain *api.Domain, d cli.VirDomain, jobCompletedEvent *libvirt.DomainEventJobCompleted, metadataCache *metadata.Cache) bool {
 	if jobCompletedEvent.Info.Operation != libvirt.DOMAIN_JOB_OPERATION_BACKUP {
 		log.Log.V(3).Infof("Recieved a job completion event for operation %v", jobCompletedEvent.Info.Operation)
-
-		return
+		return false
 	}
 
 	storage.HandleBackupJobCompletedEvent(d, jobCompletedEvent, metadataCache)
 	if value, exists := metadataCache.Backup.Load(); exists {
 		domain.Spec.Metadata.KubeVirt.Backup = &value
 	}
-	event := watch.Event{Type: watch.Added, Object: domain}
-	client.SendDomainEvent(event)
-	client.updateEvents(event, domain, events)
+	return true
 }
 
-func processLifecycleEvent(client *Notifier, domain *api.Domain, lifecycleEvent *libvirt.DomainEventLifecycle, metadataCache *metadata.Cache, events chan watch.Event, c cli.Connection, vmi *v1.VirtualMachineInstance) {
+func processLifecycleEvent(client *Notifier, domain *api.Domain, lifecycleEvent *libvirt.DomainEventLifecycle, metadataCache *metadata.Cache, events chan watch.Event, c cli.Connection, vmi *v1.VirtualMachineInstance) bool {
 	if lifecycleEvent.Event == libvirt.DOMAIN_EVENT_DEFINED &&
 		libvirt.DomainEventDefinedDetailType(lifecycleEvent.Detail) == libvirt.DOMAIN_EVENT_DEFINED_ADDED {
-		event := watch.Event{Type: watch.Added, Object: domain}
-		client.SendDomainEvent(event)
-		client.updateEvents(event, domain, events)
-	} else if lifecycleEvent.Event == libvirt.DOMAIN_EVENT_STARTED &&
+		return true
+	}
+	if lifecycleEvent.Event == libvirt.DOMAIN_EVENT_STARTED &&
 		libvirt.DomainEventStartedDetailType(lifecycleEvent.Detail) == libvirt.DOMAIN_EVENT_STARTED_MIGRATED {
-		event := watch.Event{Type: watch.Added, Object: domain}
-		client.SendDomainEvent(event)
-		client.updateEvents(event, domain, events)
-	} else if (lifecycleEvent.Event == libvirt.DOMAIN_EVENT_RESUMED && libvirt.DomainEventResumedDetailType(lifecycleEvent.Detail) == libvirt.DOMAIN_EVENT_RESUMED_MIGRATED) ||
+		return true
+	}
+	if (lifecycleEvent.Event == libvirt.DOMAIN_EVENT_RESUMED && libvirt.DomainEventResumedDetailType(lifecycleEvent.Detail) == libvirt.DOMAIN_EVENT_RESUMED_MIGRATED) ||
 		(lifecycleEvent.Event == libvirt.DOMAIN_EVENT_SUSPENDED && libvirt.DomainEventSuspendedDetailType(lifecycleEvent.Detail) == libvirt.DOMAIN_EVENT_SUSPENDED_PAUSED) {
 		// This is a libvirt event that only the target can see, and it means that the migration has completed
 		// we just set the EndTimestamp here so that the source can finalize the migration.
@@ -692,4 +738,5 @@ func processLifecycleEvent(client *Notifier, domain *api.Domain, lifecycleEvent 
 		monitor := virtwrap.NewTargetMigrationMonitor(c, events, vmi, domain, metadataCache, notifier)
 		monitor.StartMonitor()
 	}
+	return false
 }
